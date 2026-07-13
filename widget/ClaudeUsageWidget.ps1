@@ -75,6 +75,18 @@ function Read-History([string]$usagePath, [long]$sinceEpoch) {
     return $out
 }
 
+function Read-Ledger([string]$usagePath) {
+    # cost-ledger.json（日別・サブスク/API別のコスト台帳）
+    if (-not $usagePath) { return $null }
+    $p = Join-Path (Split-Path $usagePath) 'cost-ledger.json'
+    if (-not (Test-Path $p)) { return $null }
+    try {
+        return (Get-Content -Raw -Path $p -Encoding UTF8 | ConvertFrom-Json)
+    } catch {
+        return $null
+    }
+}
+
 function From-Epoch([long]$sec) {
     return [DateTimeOffset]::FromUnixTimeSeconds($sec).ToLocalTime().DateTime
 }
@@ -230,10 +242,20 @@ $Xaml = @'
 
       <Rectangle Height="1" Fill="#2C2C2A" Margin="0,14,0,0"/>
 
+      <!-- サブスクのお得分 -->
+      <TextBlock Text="サブスクのお得分（今月・API換算）" FontFamily="Segoe UI" FontSize="11" Foreground="#C3C2B7" Margin="0,14,0,0"/>
+      <Grid>
+        <TextBlock Name="TxtSaveMonth" Text="--" FontFamily="Segoe UI" FontSize="22" FontWeight="SemiBold" Foreground="#FFFFFF"/>
+        <TextBlock Name="TxtSaveToday" FontFamily="Segoe UI" FontSize="11" Foreground="#898781" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,0,4"/>
+      </Grid>
+      <TextBlock Name="TxtApiCost" FontFamily="Segoe UI" FontSize="11" Foreground="#C3C2B7" Margin="0,4,0,0" Visibility="Collapsed"/>
+
+      <Rectangle Height="1" Fill="#2C2C2A" Margin="0,14,0,0"/>
+
       <!-- セッション -->
       <TextBlock Text="セッション（直近48時間）" FontFamily="Segoe UI" FontSize="11" Foreground="#C3C2B7" Margin="0,14,0,0"/>
       <StackPanel Name="SessionsPanel" Margin="0,4,0,0"/>
-      <TextBlock Name="CostNote" Text="コストはAPI従量課金に換算した推定値（サブスクの実請求額ではありません）"
+      <TextBlock Name="CostNote" Text="「お得分」は使った量をAPI従量課金の価格に換算した推定値（サブスク利用分は実際には請求されません）"
                  FontFamily="Segoe UI" FontSize="10" Foreground="#898781" TextWrapping="Wrap" Margin="0,10,0,0"/>
     </StackPanel>
   </Border>
@@ -244,7 +266,8 @@ function New-Dashboard {
     $window = [System.Windows.Markup.XamlReader]::Parse($Xaml)
     $script:ui = @{}
     foreach ($name in @('RootBorder','TxtUpdated','Txt5Pct','Txt5Remain','Txt5Reset','Meter5Track','Meter5Fill',
-                        'Txt7Pct','Txt7Reset','Meter7Track','Meter7Fill','ChartCanvas','ChartEmpty','SessionsPanel','CostNote')) {
+                        'Txt7Pct','Txt7Reset','Meter7Track','Meter7Fill','ChartCanvas','ChartEmpty','SessionsPanel','CostNote',
+                        'TxtSaveMonth','TxtSaveToday','TxtApiCost')) {
         $script:ui[$name] = $window.FindName($name)
     }
     return $window
@@ -382,7 +405,10 @@ function Update-SessionsPanel($snap) {
         [void]$grid.Children.Add($name)
 
         $ago = New-Object System.Windows.Controls.TextBlock
-        $ago.Text = if ($active) { 'アクティブ' } else { Format-Ago $age }
+        $agoText = if ($active) { 'アクティブ' } else { Format-Ago $age }
+        # サブスクでない（=API従量課金の実費）セッションは明示する
+        $isApiBilled = ($null -ne $s.PSObject.Properties['subscription']) -and (-not $s.subscription) -and ([double]$s.cost_usd -gt 0)
+        $ago.Text = if ($isApiBilled) { "$agoText · API実費" } else { $agoText }
         $ago.FontFamily = 'Segoe UI'; $ago.FontSize = 11
         $ago.Foreground = New-WpfBrush $Col.Muted; $ago.Margin = '8,0,0,0'; $ago.VerticalAlignment = 'Center'
         [System.Windows.Controls.Grid]::SetColumn($ago, 2)
@@ -443,8 +469,35 @@ function Update-Dashboard {
     Set-Meter $script:ui.Meter7Track $script:ui.Meter7Fill $seven $stale $meterWidth
 
     Update-ChartCanvas (@(Read-History $script:dataPath ($now - 86400)))
+    Update-SavingsPanel
     Update-SessionsPanel $snap
     Update-DashboardCountdown
+}
+
+function Update-SavingsPanel {
+    $ledger = Read-Ledger $script:dataPath
+    $todayKey = (Get-Date).ToString('yyyy-MM-dd')
+    $monthKey = (Get-Date).ToString('yyyy-MM')
+    $subMonth = 0.0; $subToday = 0.0; $apiMonth = 0.0; $apiToday = 0.0
+    if ($ledger -and $ledger.days) {
+        foreach ($prop in $ledger.days.PSObject.Properties) {
+            if (-not $prop.Name.StartsWith($monthKey)) { continue }
+            $v = $prop.Value
+            $sub = if ($null -ne $v.subscription) { [double]$v.subscription } else { 0.0 }
+            $api = if ($null -ne $v.api) { [double]$v.api } else { 0.0 }
+            $subMonth += $sub; $apiMonth += $api
+            if ($prop.Name -eq $todayKey) { $subToday += $sub; $apiToday += $api }
+        }
+    }
+    $script:ui.TxtSaveMonth.Text = '${0:N2}' -f $subMonth
+    $script:ui.TxtSaveToday.Text = '今日 ${0:N2}' -f $subToday
+    if ($apiMonth -gt 0) {
+        # 従量課金の実費が出た月だけ、お得分と混ざらないよう別行で明示する
+        $script:ui.TxtApiCost.Text = 'API実費（従量課金）: 今月 ${0:N2} · 今日 ${1:N2}' -f $apiMonth, $apiToday
+        $script:ui.TxtApiCost.Visibility = 'Visible'
+    } else {
+        $script:ui.TxtApiCost.Visibility = 'Collapsed'
+    }
 }
 
 # ---- レンダリング検証モード（画面に出さずPNG保存） --------------------------

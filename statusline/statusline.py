@@ -23,7 +23,9 @@ DATA_DIR = os.environ.get("CLAUDE_USAGE_WIDGET_DIR") or os.path.expanduser(
 )
 DATA_FILE = os.path.join(DATA_DIR, "usage.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.jsonl")
+LEDGER_FILE = os.path.join(DATA_DIR, "cost-ledger.json")
 SESSION_TTL_SEC = 48 * 3600  # これより古いセッション記録はスナップショットから間引く
+LEDGER_KEEP_DAYS = 400
 HISTORY_INTERVAL_SEC = 300  # 履歴サンプリング間隔（ダッシュボードの推移グラフ用）
 HISTORY_KEEP_SEC = 7 * 24 * 3600
 HISTORY_PRUNE_SIZE = 256 * 1024  # このサイズを超えたら古い行を間引く
@@ -45,13 +47,13 @@ def load_previous():
         return {}
 
 
-def write_snapshot(snapshot):
+def write_json_atomic(path, obj):
     os.makedirs(DATA_DIR, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, ensure_ascii=False, indent=1)
-        os.replace(tmp_path, DATA_FILE)  # 読み手が中途半端なJSONを見ないようアトミックに置換
+            json.dump(obj, f, ensure_ascii=False, indent=1)
+        os.replace(tmp_path, path)  # 読み手が中途半端なJSONを見ないようアトミックに置換
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -86,6 +88,7 @@ def build_snapshot(data, prev, now):
 
     sid = data.get("session_id")
     if sid:
+        prev_session = (prev.get("sessions") or {}).get(sid) or {}
         snapshot["sessions"][sid] = {
             "updated_at": now,
             "model": (data.get("model") or {}).get("display_name"),
@@ -94,6 +97,8 @@ def build_snapshot(data, prev, now):
                 "used_percentage"
             ),
             "cwd": data.get("cwd"),
+            # rate_limitsはサブスク(Pro/Max)にしか来ない → 一度でも見えたらサブスクセッション確定
+            "subscription": bool(incoming) or bool(prev_session.get("subscription")),
         }
     return snapshot
 
@@ -135,6 +140,48 @@ def append_history(snapshot, now):
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.writelines(kept)
         os.replace(tmp_path, HISTORY_FILE)
+
+
+def update_ledger(data, now):
+    """日別のコスト台帳（API換算）。サブスク分と従量課金(API)分を別勘定で積算する。
+
+    セッションの total_cost_usd は累積値なので、前回値との差分だけをその日の合計に足す。
+    区分は「同じ入力に rate_limits が入っているか」で判定する（サブスクにしか来ないため、
+    コストが増えるAPI応答後の入力には必ず同時に含まれる）。
+    """
+    sid = data.get("session_id")
+    cost = (data.get("cost") or {}).get("total_cost_usd")
+    if not sid or cost is None:
+        return
+    try:
+        with open(LEDGER_FILE, encoding="utf-8") as f:
+            ledger = json.load(f)
+        if not isinstance(ledger, dict):
+            ledger = {}
+    except (OSError, ValueError):
+        ledger = {}
+    sessions = ledger.get("sessions") or {}
+    days = ledger.get("days") or {}
+
+    last = (sessions.get(sid) or {}).get("last_cost", 0)
+    delta = cost - last
+    if delta < 0:  # 累積値が巻き戻ることは通常ないが、あれば新規開始として扱う
+        delta = cost
+    if delta > 0:
+        day = time.strftime("%Y-%m-%d", time.localtime(now))
+        kind = "subscription" if data.get("rate_limits") else "api"
+        totals = days.setdefault(day, {})
+        totals[kind] = round(totals.get(kind, 0) + delta, 6)
+    sessions[sid] = {"last_cost": cost, "updated_at": now}
+
+    sessions = {
+        k: v
+        for k, v in sessions.items()
+        if now - v.get("updated_at", 0) < SESSION_TTL_SEC
+    }
+    if len(days) > LEDGER_KEEP_DAYS:
+        days = dict(sorted(days.items())[-LEDGER_KEEP_DAYS:])
+    write_json_atomic(LEDGER_FILE, {"schema": 1, "sessions": sessions, "days": days})
 
 
 def pct_color(pct, warn, crit):
@@ -211,8 +258,9 @@ def main():
     snapshot = build_snapshot(data, load_previous(), now)
 
     try:
-        write_snapshot(snapshot)
+        write_json_atomic(DATA_FILE, snapshot)
         append_history(snapshot, now)
+        update_ledger(data, now)
     except (OSError, ValueError):
         pass  # 書き出せなくてもstatusline表示は続行する
 

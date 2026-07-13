@@ -60,6 +60,37 @@ assert len(snap["sessions"]) == 2, "セッションが統合されていない"
 EOF
 echo "OK"
 
+echo "--- 2b. コスト台帳: 差分積算とサブスク/API別勘定"
+python3 - "$WORK_DIR/usage.json" <<'EOF'
+import json, sys
+snap = json.load(open(sys.argv[1]))
+assert snap["sessions"]["test-session-0001"]["subscription"] is True, "rate_limitsありのセッションがサブスク判定されていない"
+EOF
+# 同一セッションでコスト増(3.21→5.00) → 差分1.79が加算され日合計5.00になる
+python3 - "$WORK_DIR/input.json" <<'EOF' | python3 "$SCRIPT" > /dev/null
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["cost"]["total_cost_usd"] = 5.00
+print(json.dumps(d))
+EOF
+# rate_limitsなし＋コストあり（=API従量課金セッション相当）
+echo '{"session_id": "api-session", "cost": {"total_cost_usd": 0.50}, "model": {"display_name": "Fable 5"}}' | python3 "$SCRIPT" > /dev/null
+python3 - "$WORK_DIR/cost-ledger.json" <<'EOF'
+import json, sys, time
+ledger = json.load(open(sys.argv[1]))
+day = time.strftime("%Y-%m-%d")
+totals = ledger["days"][day]
+assert abs(totals["subscription"] - 5.00) < 1e-6, f"サブスク日合計が5.00でない: {totals}"
+assert abs(totals["api"] - 0.50) < 1e-6, f"API日合計が0.50でない: {totals}"
+assert "test-session-0001" in ledger["sessions"] and "api-session" in ledger["sessions"]
+EOF
+python3 - "$WORK_DIR/usage.json" <<'EOF'
+import json, sys
+snap = json.load(open(sys.argv[1]))
+assert snap["sessions"]["api-session"].get("subscription") is False, "rate_limitsなしセッションがサブスク判定されている"
+EOF
+echo "OK"
+
 echo "--- 3. 不正入力: クラッシュせず1行出力する"
 OUT=$(echo "not json" | python3 "$SCRIPT")
 [ -n "$OUT" ] || fail "不正入力で出力が空"
