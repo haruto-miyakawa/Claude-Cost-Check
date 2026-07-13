@@ -1,0 +1,35 @@
+{
+  "cwd": "/home/harum1020/projects/costs-window",
+  "session_id": "test-session-0001",
+  "transcript_path": "/tmp/transcript.jsonl",
+  "model": {
+    "id": "claude-fable-5",
+    "display_name": "Fable 5"
+  },
+  "workspace": {
+    "current_dir": "/home/harum1020/projects/costs-window",
+    "project_dir": "/home/harum1020/projects/costs-window",
+    "added_dirs": []
+  },
+  "version": "2.1.200",
+  "output_style": { "name": "default" },
+  "cost": {
+    "total_cost_usd": 3.21,
+    "total_duration_ms": 450000,
+    "total_api_duration_ms": 23000,
+    "total_lines_added": 156,
+    "total_lines_removed": 23
+  },
+  "context_window": {
+    "total_input_tokens": 15500,
+    "total_output_tokens": 1200,
+    "context_window_size": 200000,
+    "used_percentage": 8,
+    "remaining_percentage": 92
+  },
+  "exceeds_200k_tokens": false,
+  "rate_limits": {
+    "five_hour": { "used_percentage": 40.5, "resets_at": 0 },
+    "seven_day": { "used_percentage": 12.0, "resets_at": 0 }
+  }
+}
