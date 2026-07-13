@@ -101,3 +101,7 @@ cd widget && powershell.exe -NoProfile -ExecutionPolicy Bypass -File ClaudeUsage
 
 - `~/.claude/projects/**/*.jsonl` のローカル解析による履歴・プロジェクト別コスト集計（ccusage方式・第2段階）
 - ウィジェットの見た目強化が必要になったら .NET/WPF or Tauri へ移行（現状のPowerShell版はv0）
+
+## ライセンス
+
+MIT License（[LICENSE](LICENSE) 参照）
