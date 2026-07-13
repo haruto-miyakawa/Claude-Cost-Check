@@ -1,6 +1,9 @@
 # Claude-Cost-Check
 
 Claude Codeの使用量（5時間枠 / 7日枠）をWindowsのタスクトレイに常駐表示するウィジェット。
+トレイアイコンをクリックするとダッシュボードが開く。
+
+![ダッシュボード](docs/dashboard.png)
 
 **規約完全準拠**: データ源はClaude Code公式のstatusline機能が渡す `rate_limits` のみ。
 OAuthトークン・セッションキー・APIポーリング・スクレイピングは一切使わない。
@@ -12,20 +15,38 @@ OAuthトークン・セッションキー・APIポーリング・スクレイピ
 Claude Code (WSL)
   │ statusline JSON (stdin)          … rate_limits / cost / context_window
   ▼
-statusline/statusline.py             … ① ターミナルにstatusline表示
+statusline/statusline.py             … ① ターミナルにstatusline表示（バー付き）
   │                                    ② usage.json をアトミックに書き出し
+  │                                    ③ history.jsonl に5分間隔で使用率を記録
   ▼
-~/.local/share/claude-usage-widget/usage.json
+~/.local/share/claude-usage-widget/{usage.json, history.jsonl}
   │ \\wsl.localhost\<distro>\… 経由でファイル読み取り（5秒間隔）
   ▼
-widget/ClaudeUsageWidget.ps1 (Windows) … タスクトレイに5h使用率を数字で描画
+widget/ClaudeUsageWidget.ps1 (Windows) … トレイアイコン＋WPFダッシュボード
 ```
 
-- トレイアイコン: 5時間枠の使用率を数字＋色（緑 <50% / 黄 50–79% / 赤 ≥80% / 灰 =セッションなし）で表示
-- ツールチップ: 5h/7d使用率とリセット時刻、最終更新
-- ダブルクリック or 右クリック→「詳細を表示」: 直近48hのセッション別コストなど
+### トレイアイコン
+
+- 5時間枠の使用率を数字＋深刻度色（青 <50% / 黄 50–79% / 赤 ≥80% / 灰 =セッションなし）＋縁のゲージ弧で表示
+- ホバーで5h/7d使用率とリセット時刻のツールチップ
 - 5時間枠が80% / 95%を超えたらバルーン通知
-- statuslineはセッション中しか更新されないため、リセット時刻を過ぎた値は「↺ 0%（推定）」として表示
+
+### ダッシュボード（トレイアイコン左クリック / ダブルクリック）
+
+- **5時間枠**: 大きな使用率表示＋リセットまでのライブカウントダウン＋深刻度色メーター
+- **7日間枠**: 使用率＋リセット日時＋メーター
+- **直近24時間の使用率推移**: statusline側が5分間隔で記録した履歴のエリアチャート
+- **セッション一覧（直近48h)**: プロジェクト名・稼働状態・コスト（API従量課金換算の推定値。サブスクの実請求額ではない — 明記済み）
+- フォーカスが外れると自動で閉じる（Windowsの音量フライアウトと同じ挙動）
+- statuslineはセッション中しか更新されないため、リセット時刻を過ぎた値は「0%（推定）」として表示
+
+### ターミナルのstatusline
+
+```
+Fable 5 │ ctx 8% │ 5h ▰▰▰▱▱ 62% →20:40 │ 7d ▰▱▱▱▱ 17% →7/18 21:26
+```
+
+視認性のためブロックバー＋太字%表示。コスト（API換算$）は誤解を招きやすいのでstatuslineには出さず、ダッシュボード側に注記付きで表示する。
 
 ## セットアップ
 
@@ -65,6 +86,9 @@ tests/test.sh
 
 # Windows側: GUIなしの疎通確認（WSLから実行可）
 cd widget && powershell.exe -NoProfile -ExecutionPolicy Bypass -File ClaudeUsageWidget.ps1 -SelfTest
+
+# Windows側: ダッシュボードを画面に出さずPNGにレンダリング（デザイン確認用）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ClaudeUsageWidget.ps1 -RenderShot 'C:\path\to\out.png'
 ```
 
 ## usage.json のスキーマ（schema: 1）

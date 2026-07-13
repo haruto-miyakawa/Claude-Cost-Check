@@ -25,10 +25,13 @@ echo "--- 1. 通常入力: statusline出力とスナップショット生成"
 OUT=$(python3 "$SCRIPT" < "$WORK_DIR/input.json")
 echo "$OUT"
 echo "$OUT" | grep -q "Fable 5" || fail "モデル名が表示されていない"
-echo "$OUT" | grep -q "5h 40%" || fail "5h使用率が表示されていない (割合の丸め含む)"
-echo "$OUT" | grep -q "7d 12%" || fail "7d使用率が表示されていない"
-echo "$OUT" | grep -q '\$3.21' || fail "コストが表示されていない"
+echo "$OUT" | grep -q "5h ▰▰▱▱▱" || fail "5hバーが表示されていない (40%→2/5)"
+echo "$OUT" | grep -q "40%" || fail "5h使用率が表示されていない (割合の丸め含む)"
+echo "$OUT" | grep -q "7d ▰▱▱▱▱" || fail "7dバーが表示されていない (12%→1/5)"
+echo "$OUT" | grep -q '\$' && fail "コストがstatuslineに表示されている（ダッシュボード専用のはず）"
 [ -f "$WORK_DIR/usage.json" ] || fail "usage.json が生成されていない"
+[ -f "$WORK_DIR/history.jsonl" ] || fail "history.jsonl が生成されていない"
+[ "$(wc -l < "$WORK_DIR/history.jsonl")" = "1" ] || fail "履歴が1行でない"
 
 python3 - "$WORK_DIR/usage.json" <<'EOF'
 import json, sys
@@ -47,7 +50,8 @@ OUT=$(python3 "$SCRIPT" <<'EOF'
 EOF
 )
 echo "$OUT"
-echo "$OUT" | grep -q "5h 40%" || fail "欠落時に前回の5h値が保持されていない"
+echo "$OUT" | grep -q "40%" || fail "欠落時に前回の5h値が保持されていない"
+[ "$(wc -l < "$WORK_DIR/history.jsonl")" = "1" ] || fail "5分未満の再実行で履歴が増えた（間隔ゲートが効いていない）"
 python3 - "$WORK_DIR/usage.json" <<'EOF'
 import json, sys
 snap = json.load(open(sys.argv[1]))

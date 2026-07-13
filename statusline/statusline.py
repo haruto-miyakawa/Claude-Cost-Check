@@ -22,7 +22,11 @@ DATA_DIR = os.environ.get("CLAUDE_USAGE_WIDGET_DIR") or os.path.expanduser(
     "~/.local/share/claude-usage-widget"
 )
 DATA_FILE = os.path.join(DATA_DIR, "usage.json")
+HISTORY_FILE = os.path.join(DATA_DIR, "history.jsonl")
 SESSION_TTL_SEC = 48 * 3600  # これより古いセッション記録はスナップショットから間引く
+HISTORY_INTERVAL_SEC = 300  # 履歴サンプリング間隔（ダッシュボードの推移グラフ用）
+HISTORY_KEEP_SEC = 7 * 24 * 3600
+HISTORY_PRUNE_SIZE = 256 * 1024  # このサイズを超えたら古い行を間引く
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -94,6 +98,45 @@ def build_snapshot(data, prev, now):
     return snapshot
 
 
+def last_history_time():
+    try:
+        with open(HISTORY_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 256))
+            lines = f.read().decode("utf-8", "ignore").strip().splitlines()
+        return json.loads(lines[-1]).get("t", 0) if lines else 0
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def append_history(snapshot, now):
+    """推移グラフ用に5分間隔で使用率を記録する（セッション並行時も間隔ゲートで重複しない）"""
+    limits = snapshot.get("rate_limits") or {}
+    five = (limits.get("five_hour") or {}).get("used_percentage")
+    seven = (limits.get("seven_day") or {}).get("used_percentage")
+    if five is None and seven is None:
+        return
+    if now - last_history_time() < HISTORY_INTERVAL_SEC:
+        return
+    entry = json.dumps({"t": now, "five": five, "seven": seven}, ensure_ascii=False)
+    with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+        f.write(entry + "\n")
+    if os.path.getsize(HISTORY_FILE) > HISTORY_PRUNE_SIZE:
+        cutoff = now - HISTORY_KEEP_SEC
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            kept = [
+                line
+                for line in f
+                if line.strip()
+                and json.loads(line).get("t", 0) >= cutoff
+            ]
+        fd, tmp_path = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.writelines(kept)
+        os.replace(tmp_path, HISTORY_FILE)
+
+
 def pct_color(pct, warn, crit):
     if pct is None:
         return DIM
@@ -118,18 +161,23 @@ def fmt_reset(resets_at, now, with_date):
     return f"→{local.tm_hour:02d}:{local.tm_min:02d}"
 
 
+def bar(pct, width=5):
+    filled = 0 if pct is None else max(0, min(width, round(pct / 100 * width)))
+    return "▰" * filled + "▱" * (width - filled)
+
+
 def rate_segment(label, window, now):
     if not window:
-        return f"{DIM}{label} --{RESET}"
+        return f"{DIM}{label} {bar(None)} --{RESET}"
     pct = window.get("used_percentage")
     resets_at = window.get("resets_at")
     if resets_at and now >= resets_at:
         # リセット時刻を過ぎた古い観測値: 実際は0%に戻っているはず（次のAPI応答で更新される）
-        return f"{DIM}{label} ↺0%{RESET}"
+        return f"{DIM}{label} {bar(0)} ↺0%{RESET}"
     color = pct_color(pct, 50, 80)
     reset_txt = fmt_reset(resets_at, now, with_date=(label == "7d"))
-    reset_part = f"{DIM}({reset_txt}){RESET}" if reset_txt else ""
-    return f"{color}{label} {fmt_pct(pct)}{RESET}{reset_part}"
+    reset_part = f" {DIM}{reset_txt}{RESET}" if reset_txt else ""
+    return f"{color}{label} {bar(pct)} \033[1m{fmt_pct(pct)}{RESET}{reset_part}"
 
 
 def render_statusline(data, snapshot, now):
@@ -146,10 +194,7 @@ def render_statusline(data, snapshot, now):
     limits = snapshot.get("rate_limits") or {}
     segments.append(rate_segment("5h", limits.get("five_hour"), now))
     segments.append(rate_segment("7d", limits.get("seven_day"), now))
-
-    cost = (data.get("cost") or {}).get("total_cost_usd")
-    if cost is not None:
-        segments.append(f"${cost:.2f}")
+    # コスト(API換算)は誤解を招きやすいのでstatuslineには出さない。ダッシュボード側で注記付きで表示する
 
     return f" {DIM}│{RESET} ".join(segments)
 
@@ -167,7 +212,8 @@ def main():
 
     try:
         write_snapshot(snapshot)
-    except OSError:
+        append_history(snapshot, now)
+    except (OSError, ValueError):
         pass  # 書き出せなくてもstatusline表示は続行する
 
     print(render_statusline(data, snapshot, now))
