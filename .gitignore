@@ -1,3 +1,7 @@
 *.tmp
 __pycache__/
 .claude/
+
+# AI指示ファイル（vault導線を含み得るため非公開・ローカル専用）
+CLAUDE.md
+CLAUDE.local.md
