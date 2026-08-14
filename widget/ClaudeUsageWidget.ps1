@@ -648,6 +648,31 @@ function Show-Dashboard {
     $script:dashboard.Top = $wa.Bottom - $script:dashboard.ActualHeight - 4
 }
 
+function Open-DetailDashboard {
+    # 詳細ダッシュボード(dashboard.html)を既定のブラウザで開く。
+    # 中身はstatuslineが5分ごとに裏で作り直しているので、通常は開くだけでよい。
+    # まだ一度も生成されていないときだけ、その場でWSL側のビルドを叩く。
+    $repo = Split-Path $PSScriptRoot -Parent
+    $html = Join-Path $repo 'dashboard.html'
+    if (-not (Test-Path $html)) {
+        $build = Join-Path $repo 'dashboard\build.py'
+        if (Test-Path $build) {
+            $script:notifyIcon.ShowBalloonTip(3000, 'Claude使用量', 'ダッシュボードを生成しています…', 'Info')
+            # UNCパスをWSL内のパスに直してから実行する
+            $wslPath = (& wsl.exe wslpath -u ($build -replace '\\', '\\')) 2>$null
+            if ($wslPath) {
+                & wsl.exe -e python3 ($wslPath -replace "`r|`n", '') --quiet 2>$null
+            }
+        }
+    }
+    if (Test-Path $html) {
+        Start-Process $html
+    } else {
+        $script:notifyIcon.ShowBalloonTip(5000, 'Claude使用量',
+            'dashboard.html がまだありません。WSLで python3 dashboard/build.py を一度実行してください', 'Warning')
+    }
+}
+
 function Toggle-Dashboard {
     if ($script:dashboard.IsVisible) {
         $script:dashboard.Hide()
@@ -665,14 +690,17 @@ $script:dashboard.Add_Deactivated({ $script:dashboard.Hide(); $script:lastHideTi
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 [void]$menu.Items.Add('ダッシュボードを開く')
+[void]$menu.Items.Add('詳細ダッシュボード（ブラウザ）')
+[void]$menu.Items.Add('-')
 [void]$menu.Items.Add('usage.json を開く')
 [void]$menu.Items.Add('パスを再検出')
 [void]$menu.Items.Add('-')
 [void]$menu.Items.Add('終了')
 $menu.Items[0].Add_Click({ Show-Dashboard })
-$menu.Items[1].Add_Click({ if ($script:dataPath) { Start-Process notepad.exe $script:dataPath } })
-$menu.Items[2].Add_Click({ $script:dataPath = Find-UsageFile; Update-Tray })
-$menu.Items[4].Add_Click({ [System.Windows.Forms.Application]::Exit() })
+$menu.Items[1].Add_Click({ Open-DetailDashboard })
+$menu.Items[3].Add_Click({ if ($script:dataPath) { Start-Process notepad.exe $script:dataPath } })
+$menu.Items[4].Add_Click({ $script:dataPath = Find-UsageFile; Update-Tray })
+$menu.Items[6].Add_Click({ [System.Windows.Forms.Application]::Exit() })
 $script:notifyIcon.ContextMenuStrip = $menu
 $script:notifyIcon.Add_MouseUp({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Toggle-Dashboard } })
 

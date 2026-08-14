@@ -14,6 +14,7 @@ Claude Codeがstdinで渡すJSON（rate_limits / cost / context_window など）
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -29,6 +30,13 @@ LEDGER_KEEP_DAYS = 400
 HISTORY_INTERVAL_SEC = 300  # 履歴サンプリング間隔（ダッシュボードの推移グラフ用）
 HISTORY_KEEP_SEC = 7 * 24 * 3600
 HISTORY_PRUNE_SIZE = 256 * 1024  # このサイズを超えたら古い行を間引く
+
+# 詳細ダッシュボードの自動生成（statuslineに相乗り。詳細は maybe_rebuild_dashboard）
+DASHBOARD_BUILD = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dashboard", "build.py"
+)
+DASHBOARD_STAMP = os.path.join(DATA_DIR, "dashboard-build.stamp")
+DASHBOARD_INTERVAL_SEC = 300  # 5分に1回まで
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -246,6 +254,42 @@ def render_statusline(data, snapshot, now):
     return f" {DIM}│{RESET} ".join(segments)
 
 
+def maybe_rebuild_dashboard(now):
+    """詳細ダッシュボード(dashboard.html)を裏で作り直す。
+
+    集計元が増えるのはClaude Codeが動いている間だけで、statuslineはまさにその間だけ
+    走る。ここに相乗りすれば cron もタスクスケジューラも要らない（セッションが無い間は
+    データが変わらないので、作り直す必要もない）。
+
+    statuslineの描画は絶対に待たせない: 間隔ゲートを通ったときだけ、切り離した子プロセスへ
+    投げっぱなしにする。失敗しても黙って諦める（ダッシュボードのためにstatuslineを壊さない）。
+    無効化: 環境変数 CLAUDE_USAGE_DASHBOARD_AUTOBUILD=0
+    """
+    if os.environ.get("CLAUDE_USAGE_DASHBOARD_AUTOBUILD") == "0":
+        return
+    try:
+        if not os.path.exists(DASHBOARD_BUILD):
+            return
+        try:
+            last = os.path.getmtime(DASHBOARD_STAMP)
+        except OSError:
+            last = 0
+        if now - last < DASHBOARD_INTERVAL_SEC:
+            return
+        os.makedirs(DATA_DIR, exist_ok=True)
+        # 先にスタンプを打つ: 並行セッションが同時に走っても起動は1本に絞られる
+        with open(DASHBOARD_STAMP, "w", encoding="utf-8") as f:
+            f.write(str(now))
+        with open(os.devnull, "wb") as devnull:
+            subprocess.Popen(
+                [sys.executable, DASHBOARD_BUILD, "--quiet"],
+                stdin=devnull, stdout=devnull, stderr=devnull,
+                start_new_session=True,  # 親(statusline)が終了しても生き残らせる
+            )
+    except Exception:
+        pass
+
+
 def main():
     try:
         data = json.load(sys.stdin)
@@ -265,6 +309,7 @@ def main():
         pass  # 書き出せなくてもstatusline表示は続行する
 
     print(render_statusline(data, snapshot, now))
+    maybe_rebuild_dashboard(now)
 
 
 if __name__ == "__main__":
