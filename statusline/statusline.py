@@ -10,14 +10,23 @@ Claude Codeがstdinで渡すJSON（rate_limits / cost / context_window など）
 - rate_limits はPro/Max加入者のみ・セッション初回API応答後に出現。five_hour/seven_day は
   独立に欠落しうるので、欠落時は前回スナップショットの値を保持する（observed_at で鮮度を区別）。
 - statuslineは失敗してもClaude CodeのUIを壊さないよう、例外時は最低限の行を出して正常終了する。
+  ただし**黙って終わらない**: 失敗の理由は必ず statusline.err に残す（下記）。
+
+失敗を黙殺しない方針（2026-08-17）:
+  Claude Code は statusline の非ゼロ終了も stderr も画面に出さない。そのため「設定したのに
+  効いていない」状態が何日も気づかれないことが実際に起きた（Windows側の計上漏れ・3日間）。
+  対策として、想定外はすべて DATA_DIR/statusline.err に追記し、ダッシュボードの
+  「計上の健全性」カードがその内容と計上漏れの疑いを表示する。
 """
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 
 DATA_DIR = os.environ.get("CLAUDE_USAGE_WIDGET_DIR") or os.path.expanduser(
     "~/.local/share/claude-usage-widget"
@@ -25,6 +34,8 @@ DATA_DIR = os.environ.get("CLAUDE_USAGE_WIDGET_DIR") or os.path.expanduser(
 DATA_FILE = os.path.join(DATA_DIR, "usage.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.jsonl")
 LEDGER_FILE = os.path.join(DATA_DIR, "cost-ledger.json")
+ERROR_FILE = os.path.join(DATA_DIR, "statusline.err")
+ERROR_FILE_MAX = 64 * 1024  # これを超えたら古い方から捨てる（無限に太らせない）
 SESSION_TTL_SEC = 48 * 3600  # これより古いセッション記録はスナップショットから間引く
 LEDGER_KEEP_DAYS = 400
 HISTORY_INTERVAL_SEC = 300  # 履歴サンプリング間隔（ダッシュボードの推移グラフ用）
@@ -44,6 +55,52 @@ BOLD_CYAN = "\033[1;36m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
+
+
+def log_problem(stage, message, exc=None):
+    """想定外を statusline.err に追記する。ここ自体は絶対に例外を投げない。
+
+    Claude Code は statusline の stderr も終了コードも見せてくれないので、
+    ここが唯一の「失敗した」という痕跡になる。あとから原因を追えるよう、
+    どのホストのどのプロセスから呼ばれたかも一緒に残す。
+    """
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        head = (
+            f"{time.strftime('%Y-%m-%dT%H:%M:%S')} [{stage}] {message} "
+            f"(pid={os.getpid()} cwd={os.getcwd()} python={sys.executable})"
+        )
+        body = ""
+        if exc is not None:
+            body = "\n" + "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            ).rstrip()
+        with open(ERROR_FILE, "a", encoding="utf-8") as f:
+            f.write(head + body + "\n")
+        if os.path.getsize(ERROR_FILE) > ERROR_FILE_MAX:
+            with open(ERROR_FILE, encoding="utf-8") as f:
+                tail = f.read()[-(ERROR_FILE_MAX // 2):]
+            fd, tmp_path = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("（古いログは切り詰め済み）\n" + tail)
+            os.replace(tmp_path, ERROR_FILE)
+    except Exception:
+        pass  # ログすら書けない状況でstatuslineを巻き込まない
+
+
+def host_of(cwd):
+    """セッションがWindowsネイティブ側かWSL側かを cwd から判定する。
+
+    Claude Code は Windows でも WSL でも同じ statusline を呼びうるが、
+    書き出し先は WSL 側の1か所に集約される。どちら由来かを残しておかないと、
+    片側だけ計上漏れしていても気づけない（実際に3日気づけなかった）。
+    """
+    if not cwd:
+        return "unknown"
+    s = str(cwd)
+    if re.match(r"^[A-Za-z]:[\\/]", s) or s.startswith("\\\\"):
+        return "windows"
+    return "wsl"
 
 
 def load_previous():
@@ -105,6 +162,7 @@ def build_snapshot(data, prev, now):
                 "used_percentage"
             ),
             "cwd": data.get("cwd"),
+            "host": host_of(data.get("cwd")),
             # rate_limitsはサブスク(Pro/Max)にしか来ない → 一度でも見えたらサブスクセッション確定
             "subscription": bool(incoming) or bool(prev_session.get("subscription")),
         }
@@ -156,6 +214,10 @@ def update_ledger(data, now):
     セッションの total_cost_usd は累積値なので、前回値との差分だけをその日の合計に足す。
     区分は「同じ入力に rate_limits が入っているか」で判定する（サブスクにしか来ないため、
     コストが増えるAPI応答後の入力には必ず同時に含まれる）。
+
+    日ごとに by_host（windows/wsl別の内訳）も持つ。合計だけだと、片方のホストが
+    丸ごと計上漏れしていても「その日は作業が少なかった」と区別がつかないため。
+    by_host は2026-08-17からの追加なので、それ以前の日には存在しない。
     """
     sid = data.get("session_id")
     cost = (data.get("cost") or {}).get("total_cost_usd")
@@ -180,6 +242,8 @@ def update_ledger(data, now):
         kind = "subscription" if data.get("rate_limits") else "api"
         totals = days.setdefault(day, {})
         totals[kind] = round(totals.get(kind, 0) + delta, 6)
+        per_host = totals.setdefault("by_host", {}).setdefault(host_of(data.get("cwd")), {})
+        per_host[kind] = round(per_host.get(kind, 0) + delta, 6)
     sessions[sid] = {"last_cost": cost, "updated_at": now}
 
     sessions = {
@@ -262,13 +326,14 @@ def maybe_rebuild_dashboard(now):
     データが変わらないので、作り直す必要もない）。
 
     statuslineの描画は絶対に待たせない: 間隔ゲートを通ったときだけ、切り離した子プロセスへ
-    投げっぱなしにする。失敗しても黙って諦める（ダッシュボードのためにstatuslineを壊さない）。
+    投げっぱなしにする。失敗してもstatuslineは壊さないが、理由は statusline.err に残す。
     無効化: 環境変数 CLAUDE_USAGE_DASHBOARD_AUTOBUILD=0
     """
     if os.environ.get("CLAUDE_USAGE_DASHBOARD_AUTOBUILD") == "0":
         return
     try:
         if not os.path.exists(DASHBOARD_BUILD):
+            log_problem("dashboard", f"build.py が見つからない: {DASHBOARD_BUILD}")
             return
         try:
             last = os.path.getmtime(DASHBOARD_STAMP)
@@ -286,34 +351,66 @@ def maybe_rebuild_dashboard(now):
                 stdin=devnull, stdout=devnull, stderr=devnull,
                 start_new_session=True,  # 親(statusline)が終了しても生き残らせる
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        log_problem("dashboard", "ダッシュボードの再生成を起動できなかった", exc)
+
+
+def read_input():
+    """stdinのJSONを読む。読めなかった理由は握りつぶさず statusline.err に残す。
+
+    「Claude CodeがJSONを渡してくれていない」は起動経路の設定ミスで実際に起きる
+    （例: Git Bash経由でwsl.exeを呼ぶとパスが化けてスクリプトごと起動しない）。
+    空入力のまま黙って書き込むと updated_by=null のスナップショットが延々と上書きされ、
+    「動いているように見えるのに何も記録されない」状態になるため、そこで止める。
+    """
+    try:
+        raw = sys.stdin.read()
+    except Exception as exc:
+        log_problem("stdin", "stdinを読めなかった", exc)
+        return None
+    if not raw.strip():
+        log_problem("stdin", "stdinが空（Claude CodeからのJSONが届いていない）")
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        log_problem("stdin", f"stdinがJSONとして読めない: 先頭120字={raw[:120]!r}", exc)
+        return None
+    if not isinstance(data, dict):
+        log_problem("stdin", f"stdinのJSONがオブジェクトでない: {type(data).__name__}")
+        return None
+    if not data.get("session_id"):
+        log_problem("stdin", f"session_idが無い: keys={sorted(data)}")
+    return data
 
 
 def main():
-    try:
-        data = json.load(sys.stdin)
-        if not isinstance(data, dict):
-            data = {}
-    except ValueError:
-        data = {}
-
+    data = read_input()
     now = int(time.time())
-    snapshot = build_snapshot(data, load_previous(), now)
+    usable = data is not None
 
-    try:
-        write_json_atomic(DATA_FILE, snapshot)
-        append_history(snapshot, now)
-        update_ledger(data, now)
-    except (OSError, ValueError):
-        pass  # 書き出せなくてもstatusline表示は続行する
+    snapshot = build_snapshot(data or {}, load_previous(), now)
 
-    print(render_statusline(data, snapshot, now))
+    if usable:
+        # 入力が使えたときだけ書く。空入力で上書きすると計上漏れが見えなくなる
+        for stage, fn in (
+            ("usage.json", lambda: write_json_atomic(DATA_FILE, snapshot)),
+            ("history.jsonl", lambda: append_history(snapshot, now)),
+            ("cost-ledger.json", lambda: update_ledger(data, now)),
+        ):
+            try:
+                fn()
+            except Exception as exc:
+                log_problem(stage, "書き出しに失敗した", exc)
+
+    print(render_statusline(data or {}, snapshot, now))
     maybe_rebuild_dashboard(now)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        print("claude-usage-widget: error")  # UIを壊さないため必ず1行出して正常終了
+    except Exception as exc:
+        # UIを壊さないため必ず1行出して正常終了する。ただし理由はログに必ず残す
+        log_problem("main", "statuslineが例外で終了した", exc)
+        print("claude-usage-widget: error（詳細は statusline.err）")

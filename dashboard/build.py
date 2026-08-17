@@ -29,11 +29,22 @@ DEFAULT_OUT = os.path.join(os.path.dirname(HERE), "dashboard.html")
 # 過去ぶんの集計はここに残る（statusline のデータには触らない別ファイル）
 CACHE_FILE = os.path.join(DATA_DIR, "transcript-cache.json")
 
-# トランスクリプトの探索先（WSL側とWindows側の両方。存在するものだけ使う）
-TRANSCRIPT_GLOBS = [
-    os.path.expanduser("~/.claude/projects/*/*.jsonl"),
-    "/mnt/c/Users/*/.claude/projects/*/*.jsonl",
-]
+# トランスクリプトの探索先（WSL側とWindows側の両方。存在するものだけ使う）。
+# テストから差し替えられるよう、環境変数で上書きできる（`:` 区切り）
+TRANSCRIPT_GLOBS = (
+    os.environ.get("CLAUDE_USAGE_TRANSCRIPT_GLOBS", "").split(":")
+    if os.environ.get("CLAUDE_USAGE_TRANSCRIPT_GLOBS")
+    else [
+        os.path.expanduser("~/.claude/projects/*/*.jsonl"),
+        "/mnt/c/Users/*/.claude/projects/*/*.jsonl",
+    ]
+)
+
+# statusline が失敗を書き残す先（「計上の健全性」カードで表示する）
+ERROR_FILE = os.path.join(DATA_DIR, "statusline.err")
+ERROR_TAIL_LINES = 12
+
+HOST_LABELS = {"windows": "Windows側", "wsl": "WSL側", "unknown": "(不明)"}
 
 # 公式の従量課金レート（$ / 100万トークン）。サブスク利用でも「API換算いくらぶんか」を出すために使う。
 # 出典: claude-api skill のモデル表（2026-06-24 時点のキャッシュ）
@@ -122,6 +133,16 @@ def project_name(cwd):
     return parts[-1] if parts else "(不明)"
 
 
+def host_of(cwd):
+    """cwd がWindowsネイティブ側かWSL側か。statusline.py の同名関数と同じ判定。"""
+    if not cwd:
+        return "unknown"
+    s = str(cwd)
+    if re.match(r"^[A-Za-z]:[\\/]", s) or s.startswith("\\\\"):
+        return "windows"
+    return "wsl"
+
+
 def cost_of(model, usage):
     """1レスポンスぶんのAPI換算コスト（$）。キャッシュのTTL別倍率まで見る。"""
     price = PRICING.get(model)
@@ -182,6 +203,9 @@ def scan_file(path):
     """
     agg = {
         "project": {}, "model": {}, "day": {},
+        # host: windows/wsl別の内訳。day_host は "YYYY-MM-DD|host" をキーにした日×ホスト。
+        # 「トランスクリプトには活動があるのに台帳に記録が無い日」を割り出すために使う
+        "host": {}, "day_host": {},
         "heat": {}, "tools": {},
         "totals": {k: 0 for k in NUMERIC_KEYS},
         "sessions": set(),
@@ -233,9 +257,16 @@ def scan_file(path):
             sid = rec.get("sessionId") or rec.get("session_id") or ""
             ts = parse_ts(rec.get("timestamp"))
 
-            targets = [bucket("project", project_name(rec.get("cwd"))), bucket("model", model)]
+            host = host_of(rec.get("cwd"))
+            targets = [
+                bucket("project", project_name(rec.get("cwd"))),
+                bucket("model", model),
+                bucket("host", host),
+            ]
             if ts:
-                targets.append(bucket("day", time.strftime("%Y-%m-%d", time.localtime(ts))))
+                day = time.strftime("%Y-%m-%d", time.localtime(ts))
+                targets.append(bucket("day", day))
+                targets.append(bucket("day_host", f"{day}|{host}"))
                 lt = time.localtime(ts)
                 hk = f"{lt.tm_wday},{lt.tm_hour}"
                 agg["heat"][hk] = agg["heat"].get(hk, 0) + 1
@@ -268,10 +299,35 @@ def scan_file(path):
             t["web_search"] += stu.get("web_search_requests") or 0
             t["web_fetch"] += stu.get("web_fetch_requests") or 0
 
-    for kind in ("project", "model", "day"):
+    for kind in ("project", "model", "day", "host", "day_host"):
         agg[kind] = {k: bucket_to_json(v) for k, v in agg[kind].items()}
     agg["sessions"] = sorted(agg["sessions"])
     return agg
+
+
+def host_of_path(path):
+    """トランスクリプトの置き場所からホストを決める。
+
+    探索先は「WSLのホーム」と「/mnt/<ドライブ>/Users/…（Windows側のホーム）」の2種類だけなので、
+    パスだけで確実に分かる。cwd から引く host_of と結果は一致する。
+    """
+    return "windows" if re.match(r"^/mnt/[a-zA-Z]/Users/", path) else "wsl"
+
+
+def migrate_agg_v1(path, agg):
+    """schema 1 のキャッシュ項目に host / day_host を補う（その場で書き換える）。
+
+    1ファイルは1プロジェクト＝1ホストぶんなので、パスから決めたホストに全量を寄せてよい。
+    再スキャンで作り直せない（Claude Codeに消されたファイルの）集計を守るための移行。
+    """
+    if "host" in agg and "day_host" in agg:
+        return
+    host = host_of_path(path)
+    totals = agg.get("totals") or {}
+    whole = {k: totals.get(k, 0) for k in NUMERIC_KEYS}
+    whole["sessions"] = sorted(agg.get("sessions") or [])
+    agg["host"] = {host: whole}
+    agg["day_host"] = {f"{day}|{host}": dict(b) for day, b in (agg.get("day") or {}).items()}
 
 
 def scan_transcripts():
@@ -282,9 +338,15 @@ def scan_transcripts():
     元ファイルが消えても過去ぶんの集計は残る。mtime と size が変わらなければ
     再読み込みもしないので、2回目以降は速い。
     """
+    # schema 2 (2026-08-17): host / day_host の内訳を追加。
+    # 旧キャッシュは捨てずに移行する（消えたファイルの集計はもう読み直せないため）
     cache = load_json(CACHE_FILE, {})
-    if cache.get("schema") != 1 or not isinstance(cache.get("files"), dict):
-        cache = {"schema": 1, "files": {}}
+    if not isinstance(cache.get("files"), dict) or cache.get("schema") not in (1, 2):
+        cache = {"schema": 2, "files": {}}
+    if cache.get("schema") == 1:
+        for path, entry in cache["files"].items():
+            migrate_agg_v1(path, entry.get("agg") or {})
+        cache["schema"] = 2
     files = cache["files"]
 
     present, rescanned = set(), 0
@@ -311,6 +373,8 @@ def scan_transcripts():
     by_project = collections.defaultdict(blank_bucket)
     by_model = collections.defaultdict(blank_bucket)
     by_day = collections.defaultdict(blank_bucket)
+    by_host = collections.defaultdict(blank_bucket)
+    by_day_host = collections.defaultdict(blank_bucket)
     heat = collections.Counter()
     tools = collections.Counter()
     totals = blank_bucket()
@@ -319,7 +383,10 @@ def scan_transcripts():
 
     for real, entry in files.items():
         agg = entry.get("agg") or {}
-        for kind, dst in (("project", by_project), ("model", by_model), ("day", by_day)):
+        for kind, dst in (
+            ("project", by_project), ("model", by_model), ("day", by_day),
+            ("host", by_host), ("day_host", by_day_host),
+        ):
             for name, b in (agg.get(kind) or {}).items():
                 merge_bucket(dst[name], b)
         for k, n in (agg.get("heat") or {}).items():
@@ -343,6 +410,8 @@ def scan_transcripts():
         "by_project": by_project,
         "by_model": by_model,
         "by_day": by_day,
+        "by_host": by_host,
+        "by_day_host": by_day_host,
         "heat": heat,
         "tools": tools,
         "totals": totals,
@@ -378,6 +447,92 @@ def rank(mapping, limit, label_fn=lambda k: k):
     return head
 
 
+def read_error_tail():
+    """statusline.err の末尾を読む。statusline が黙って失敗していないかの確認用。"""
+    try:
+        st = os.stat(ERROR_FILE)
+        with open(ERROR_FILE, encoding="utf-8", errors="replace") as f:
+            lines = [ln.rstrip() for ln in f if ln.strip()]
+    except OSError:
+        return {"exists": False, "lines": [], "count": 0, "mtime": 0}
+    return {
+        "exists": True,
+        "lines": lines[-ERROR_TAIL_LINES:],
+        "count": len(lines),
+        "mtime": int(st.st_mtime),
+    }
+
+
+def build_health(scan, ledger):
+    """「記録できているつもりで記録できていない」を検出する。
+
+    ホスト（Windows側 / WSL側）ごとに、トランスクリプト実測とコスト台帳を突き合わせる。
+    トランスクリプトに応答があるのに台帳にその日・そのホストの記録が無ければ、
+    statusline がそのホストで動いていない＝計上漏れとして並べる。2026-08-14に
+    Windows側へstatuslineを登録したのに実際は起動すらしていなかった件を、
+    次からは翌日に気づけるようにするためのカード。
+    """
+    days = ledger.get("days") or {}
+
+    last_day, per_host = {}, {}
+    for key, bucket in scan["by_day_host"].items():
+        day, _, host = key.partition("|")
+        per_host.setdefault(host, []).append((day, bucket))
+        if day > last_day.get(host, ""):
+            last_day[host] = day
+
+    hosts = []
+    for host, bucket in sorted(
+        scan["by_host"].items(), key=lambda kv: -kv[1]["messages"]
+    ):
+        ledger_cost = sum(
+            (((v or {}).get("by_host") or {}).get(host) or {}).get(kind, 0)
+            for v in days.values()
+            for kind in ("subscription", "api")
+        )
+        hosts.append({
+            "host": host,
+            "label": HOST_LABELS.get(host, host),
+            "messages": bucket["messages"],
+            "tokens": bucket["input"] + bucket["output"] + bucket["cache_write"],
+            "cost": round(bucket["cost"], 4),
+            "sessions": len(bucket["sessions"]),
+            "last_day": last_day.get(host, ""),
+            "ledger_cost": round(ledger_cost, 4),
+        })
+
+    gaps = []
+    for host, rows in per_host.items():
+        for day, bucket in rows:
+            if not bucket["messages"]:
+                continue
+            entry = days.get(day)
+            if entry is None:
+                reason = "台帳にこの日の記録が無い"
+            elif "by_host" not in entry:
+                continue  # by_host以前(〜2026-08-16)の日はホスト別に判定できない
+            elif host not in (entry.get("by_host") or {}):
+                reason = "台帳のこの日にこのホストぶんが無い"
+            else:
+                continue
+            gaps.append({
+                "day": day,
+                "host": host,
+                "label": HOST_LABELS.get(host, host),
+                "messages": bucket["messages"],
+                "est_cost": round(bucket["cost"], 4),
+                "reason": reason,
+            })
+    gaps.sort(key=lambda g: (g["day"], g["host"]), reverse=True)
+
+    return {
+        "hosts": hosts,
+        "gaps": gaps,
+        "gap_cost": round(sum(g["est_cost"] for g in gaps), 4),
+        "errors": read_error_tail(),
+    }
+
+
 def build_payload():
     usage = load_json(os.path.join(DATA_DIR, "usage.json"), {})
     ledger = load_json(os.path.join(DATA_DIR, "cost-ledger.json"), {})
@@ -405,13 +560,18 @@ def build_payload():
     now = int(time.time())
 
     days = ledger.get("days") or {}
+    est_by_day = {d: b["cost"] for d, b in scan["by_day"].items()}
+    # 日の軸は台帳とトランスクリプトの和集合。台帳に無い日を落とすと、まさに
+    # 「計上漏れした日」がグラフから消えて気づけなくなる
     ledger_days = [
         {
             "day": d,
-            "subscription": round((v or {}).get("subscription", 0), 4),
-            "api": round((v or {}).get("api", 0), 4),
+            "subscription": round((days.get(d) or {}).get("subscription", 0), 4),
+            "api": round((days.get(d) or {}).get("api", 0), 4),
+            # 同じ日をトランスクリプトから推定した額。台帳と大きく食い違えば計上漏れの疑い
+            "estimated": round(est_by_day.get(d, 0), 4),
         }
-        for d, v in sorted(days.items())
+        for d in sorted(set(days) | set(est_by_day))
     ]
 
     sessions = []
@@ -425,6 +585,7 @@ def build_payload():
                 "cost": s.get("cost_usd"),
                 "ctx": s.get("context_used_percentage"),
                 "cwd": project_name(s.get("cwd")),
+                "host": s.get("host") or host_of(s.get("cwd")),
                 "updated_at": s.get("updated_at"),
                 "subscription": bool(s.get("subscription")),
             }
@@ -458,6 +619,7 @@ def build_payload():
             {"name": n, "n": c} for n, c in scan["tools"].most_common(TOP_TOOLS)
         ],
         "totals": totals,
+        "health": build_health(scan, ledger),
     }
 
 
@@ -628,6 +790,34 @@ details.tv th { color: var(--muted); font-weight: 500; }
 footer.notes { color: var(--muted); font-size: 12px; margin-top: 26px; line-height: 1.8; }
 footer.notes code { font-size: 11.5px; }
 
+/* ---- health ---- */
+.card.health { border-left: 3px solid var(--good); }
+.card.health.warn { border-left-color: var(--warning); }
+.card.health.bad { border-left-color: var(--critical); }
+.verdict { display: flex; align-items: baseline; gap: 10px; font-size: 13.5px; margin: 0 0 16px; }
+.verdict .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--good); flex: none; align-self: center; }
+.card.health.warn .verdict .dot { background: var(--warning); }
+.card.health.bad .verdict .dot { background: var(--critical); }
+.hosts { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px 22px; margin-bottom: 6px; }
+.hosts .hcard { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+.hosts .hname { font-size: 13px; font-weight: 650; margin-bottom: 6px; }
+.hosts dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 0; font-size: 12.5px; }
+.hosts dt { color: var(--muted); }
+.hosts dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; color: var(--text-secondary); }
+.gaps { margin-top: 16px; }
+.gaps table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+.gaps th, .gaps td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+.gaps th:first-child, .gaps td:first-child,
+.gaps th:nth-child(2), .gaps td:nth-child(2),
+.gaps th:last-child, .gaps td:last-child { text-align: left; font-variant-numeric: normal; }
+.gaps th { color: var(--muted); font-weight: 500; }
+pre.errlog {
+  margin: 10px 0 0; padding: 10px 12px; border-radius: 8px;
+  background: var(--plane); border: 1px solid var(--border);
+  font-size: 11.5px; line-height: 1.65; overflow-x: auto; white-space: pre;
+  color: var(--text-secondary);
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
@@ -667,6 +857,15 @@ footer.notes code { font-size: 11.5px; }
   <div class="tiles" id="tiles"></div>
 </section>
 
+<section class="card health" id="health">
+  <h2>計上の健全性</h2>
+  <p class="note">statusline（コスト台帳）とトランスクリプト実測を突き合わせ、記録できていないホスト・日を洗い出す。</p>
+  <div class="verdict" id="verdict"></div>
+  <div class="hosts" id="hosts"></div>
+  <div class="gaps" id="gaps"></div>
+  <div id="errbox"></div>
+</section>
+
 <section class="card">
   <h2>使用率の推移</h2>
   <p class="note" id="histnote"></p>
@@ -684,6 +883,7 @@ footer.notes code { font-size: 11.5px; }
   <div class="legend">
     <span class="key"><i style="background:var(--s1)"></i>サブスク枠（実支払いなし）</span>
     <span class="key"><i style="background:var(--s2)"></i>API従量課金</span>
+    <span class="key"><i style="background:var(--s3)"></i>トランスクリプト実測からの推定</span>
   </div>
   <div class="chart" id="costchart"></div>
   <details class="tv"><summary>表で見る</summary><div id="costtable"></div></details>
@@ -882,6 +1082,59 @@ gauge("g7", "g7t", "g7r", D.rate_limits.seven_day, "7d");
   }
 })();
 
+/* ---------- health: are we recording everything? ---------- */
+(function health() {
+  const H = D.health;
+  const card = document.getElementById("health");
+  const hostBox = document.getElementById("hosts");
+  const fmtDay = d => d ? d.slice(5).replace("-", "/") : "–";
+
+  for (const h of H.hosts) {
+    const dl = el("dl", {}, [
+      el("dt", {}, ["応答"]),        el("dd", {}, [fmtInt(h.messages)]),
+      el("dt", {}, ["トークン"]),    el("dd", {}, [fmtTok(h.tokens)]),
+      el("dt", {}, ["推定コスト"]),  el("dd", {}, [fmtUsd(h.cost)]),
+      el("dt", {}, ["台帳の記録"]),  el("dd", {}, [h.ledger_cost > 0 ? fmtUsd(h.ledger_cost) : "なし"]),
+      el("dt", {}, ["最終活動"]),    el("dd", {}, [fmtDay(h.last_day)]),
+    ]);
+    hostBox.appendChild(el("div", {class: "hcard"}, [
+      el("div", {class: "hname"}, [h.label]), dl,
+    ]));
+  }
+
+  // 判定: 未計上の日があれば警告、statusline.err があれば異常
+  const nErr = H.errors.exists ? H.errors.count : 0;
+  const nGap = H.gaps.length;
+  const state = nErr ? "bad" : (nGap ? "warn" : "ok");
+  if (state !== "ok") card.classList.add(state);
+  const msg = state === "bad"
+    ? `statusline がエラーを記録している（${fmtInt(nErr)}件）。下のログを確認すること。`
+    : state === "warn"
+      ? `トランスクリプトに活動があるのに台帳に記録が無い日が ${nGap} 件（推定 ${fmtUsd(H.gap_cost)} ぶん）。`
+      : "台帳とトランスクリプトの対象ホスト・日は一致している。計上漏れは検出されていない。";
+  document.getElementById("verdict").appendChild(el("span", {class: "dot"}));
+  document.getElementById("verdict").appendChild(el("span", {}, [msg]));
+
+  if (nGap) {
+    const box = document.getElementById("gaps");
+    const rows = H.gaps.slice(0, 20).map(g =>
+      [g.day, g.label, fmtInt(g.messages), fmtUsd(g.est_cost), g.reason]);
+    box.appendChild(el("div", {class: "note", style: "color:var(--muted);font-size:12.5px;margin-bottom:6px"},
+      ["未計上の疑いがある日（推定コストは公式レートからの目安で、台帳へは遡って足さない）"]));
+    box.appendChild(table(["日付", "ホスト", "応答", "推定$", "理由"], rows));
+    if (H.gaps.length > 20) {
+      box.appendChild(el("div", {class: "note"}, [`ほか ${H.gaps.length - 20} 件`]));
+    }
+  }
+
+  if (H.errors.exists && H.errors.lines.length) {
+    const box = document.getElementById("errbox");
+    box.appendChild(el("div", {class: "note", style: "margin-top:16px"},
+      [`statusline.err（末尾 ${H.errors.lines.length} 行 / 全 ${fmtInt(H.errors.count)} 行・最終 ${fmtDateTime(H.errors.mtime)}）`]));
+    box.appendChild(el("pre", {class: "errlog"}, [H.errors.lines.join("\n")]));
+  }
+})();
+
 /* ---------- line chart: rate-limit history ---------- */
 (function history() {
   const host = document.getElementById("histchart");
@@ -969,7 +1222,7 @@ gauge("g7", "g7t", "g7r", D.rate_limits.seven_day, "7d");
   const W = Math.max(680, Math.min(1120, host.clientWidth || 900)), H = 250;
   const M = {t: 12, r: 14, b: 30, l: 46};
   const iw = W - M.l - M.r, ih = H - M.t - M.b;
-  const max = Math.max(...rows.map(r => r.subscription + r.api), 1);
+  const max = Math.max(...rows.map(r => Math.max(r.subscription + r.api, r.estimated)), 1);
   const nice = Math.ceil(max / 25) * 25 || 25;
   const band = iw / rows.length;
   const bw = Math.min(24, band - 4);
@@ -1004,9 +1257,12 @@ gauge("g7", "g7t", "g7r", D.rate_limits.seven_day, "7d");
       acc += v;
     }
     const hit = svgEl("rect", {x: M.l + band * i, y: M.t, width: band, height: ih, fill: "transparent"});
+    const missing = r.estimated > 0 && total === 0;
     hit.addEventListener("mousemove", ev => showTip(
       `<b>${r.day}</b><br><span class="k">サブスク</span> ${fmtUsd(r.subscription)}<br>` +
-      `<span class="k">API</span> ${fmtUsd(r.api)}<br><span class="k">合計</span> ${fmtUsd(total)}`,
+      `<span class="k">API</span> ${fmtUsd(r.api)}<br><span class="k">合計</span> ${fmtUsd(total)}<br>` +
+      `<span class="k">実測からの推定</span> ${fmtUsd(r.estimated)}` +
+      (missing ? `<br><b>台帳に記録なし（計上漏れ）</b>` : ""),
       ev.clientX, ev.clientY));
     hit.addEventListener("mouseleave", hideTip);
     svg.appendChild(hit);
@@ -1016,6 +1272,16 @@ gauge("g7", "g7t", "g7r", D.rate_limits.seven_day, "7d");
                                      fill: "var(--muted)", "font-size": 11}, [d]));
     }
   });
+  // トランスクリプト実測からの推定を重ねる。棒（台帳）だけが低い日＝statuslineが動いていない日
+  let dEst = "";
+  rows.forEach((r, i) => {
+    const x = M.l + band * i + band / 2;
+    dEst += (dEst ? "L" : "M") + x.toFixed(1) + " " + Y(r.estimated).toFixed(1);
+  });
+  if (dEst) {
+    svg.appendChild(svgEl("path", {class: "line-path", d: dEst, stroke: "var(--s3)",
+                                   "stroke-dasharray": "4 3", "stroke-width": 1.5, opacity: .9}));
+  }
   host.appendChild(svg);
   onReveal(host, () => {
     bars.forEach((b, i) => {
@@ -1029,8 +1295,9 @@ gauge("g7", "g7t", "g7r", D.rate_limits.seven_day, "7d");
     });
   });
   document.getElementById("costtable").appendChild(table(
-    ["日付", "サブスク", "API", "合計"],
-    rows.slice().reverse().map(r => [r.day, fmtUsd(r.subscription), fmtUsd(r.api), fmtUsd(r.subscription + r.api)])
+    ["日付", "サブスク", "API", "台帳合計", "実測推定"],
+    rows.slice().reverse().map(r => [r.day, fmtUsd(r.subscription), fmtUsd(r.api),
+                                     fmtUsd(r.subscription + r.api), fmtUsd(r.estimated)])
   ));
 })();
 

@@ -74,7 +74,7 @@ d["cost"]["total_cost_usd"] = 5.00
 print(json.dumps(d))
 EOF
 # rate_limitsなし＋コストあり（=API従量課金セッション相当）
-echo '{"session_id": "api-session", "cost": {"total_cost_usd": 0.50}, "model": {"display_name": "Fable 5"}}' | python3 "$SCRIPT" > /dev/null
+echo '{"session_id": "api-session", "cwd": "/home/u/proj", "cost": {"total_cost_usd": 0.50}, "model": {"display_name": "Fable 5"}}' | python3 "$SCRIPT" > /dev/null
 python3 - "$WORK_DIR/cost-ledger.json" <<'EOF'
 import json, sys, time
 ledger = json.load(open(sys.argv[1]))
@@ -91,10 +91,37 @@ assert snap["sessions"]["api-session"].get("subscription") is False, "rate_limit
 EOF
 echo "OK"
 
+echo "--- 2c. ホスト判定: Windows側セッションを windows として記録し、台帳もホスト別に分ける"
+echo '{"session_id": "win-session", "cwd": "E:\\obsidian-vault", "cost": {"total_cost_usd": 2.00}, "model": {"display_name": "Opus 5"}, "rate_limits": {"five_hour": {"used_percentage": 9, "resets_at": 9999999999}}}' | python3 "$SCRIPT" > /dev/null
+python3 - "$WORK_DIR/usage.json" "$WORK_DIR/cost-ledger.json" <<'EOF'
+import json, sys, time
+snap = json.load(open(sys.argv[1]))
+assert snap["sessions"]["win-session"]["host"] == "windows", "Windowsパスのcwdがwindows判定されていない"
+assert snap["sessions"]["test-session-0001"]["host"] == "wsl", "WSLパスのcwdがwsl判定されていない"
+ledger = json.load(open(sys.argv[2]))
+by_host = ledger["days"][time.strftime("%Y-%m-%d")]["by_host"]
+assert abs(by_host["windows"]["subscription"] - 2.00) < 1e-6, f"Windows側ぶんが台帳に分離されていない: {by_host}"
+assert abs(by_host["wsl"]["subscription"] - 5.00) < 1e-6, f"WSL側ぶんが台帳に分離されていない: {by_host}"
+assert abs(by_host["wsl"]["api"] - 0.50) < 1e-6, f"WSL側のAPI勘定が分離されていない: {by_host}"
+EOF
+echo "OK"
+
 echo "--- 3. 不正入力: クラッシュせず1行出力する"
 OUT=$(echo "not json" | python3 "$SCRIPT")
 [ -n "$OUT" ] || fail "不正入力で出力が空"
 echo "OK: $OUT"
+
+echo "--- 3b. 失敗を黙殺しない: statusline.err に理由が残り、空入力では上書きしない"
+[ -f "$WORK_DIR/statusline.err" ] || fail "不正入力なのに statusline.err が作られていない"
+grep -q "JSONとして読めない" "$WORK_DIR/statusline.err" || fail "不正入力の理由が記録されていない"
+BEFORE=$(cat "$WORK_DIR/usage.json")
+OUT=$(printf '' | python3 "$SCRIPT")
+[ -n "$OUT" ] || fail "空入力で出力が空"
+grep -q "stdinが空" "$WORK_DIR/statusline.err" || fail "空入力の理由が記録されていない"
+[ "$BEFORE" = "$(cat "$WORK_DIR/usage.json")" ] || fail "空入力で usage.json が上書きされた（計上漏れを隠す）"
+echo '{"cwd": "/tmp"}' | python3 "$SCRIPT" > /dev/null
+grep -q "session_idが無い" "$WORK_DIR/statusline.err" || fail "session_id欠落が記録されていない"
+echo "OK"
 
 echo "--- 4. リセット時刻超過: ↺0% 表示になる"
 python3 - "$WORK_DIR/usage.json" <<'EOF'
@@ -107,6 +134,47 @@ EOF
 OUT=$(echo '{"session_id": "test-session-0001"}' | python3 "$SCRIPT")
 echo "$OUT"
 echo "$OUT" | grep -q "↺0%" || fail "リセット超過の表示がない"
+echo "OK"
+
+echo "--- 5. ダッシュボード: ホスト別集計と計上漏れの検出"
+# Windows側のトランスクリプトを模したファイルを作る（台帳には存在しない日付にする）
+FAKE="$WORK_DIR/fake/E--obsidian-vault"
+mkdir -p "$FAKE"
+python3 - "$FAKE/win-sess.jsonl" <<'EOF'
+import json, sys
+rec = {
+    "type": "assistant", "cwd": "E:\\obsidian-vault", "sessionId": "win-sess",
+    "timestamp": "2020-01-02T03:04:05Z", "requestId": "req-1",
+    "message": {"model": "claude-opus-5", "usage": {
+        "input_tokens": 1000, "output_tokens": 500, "cache_read_input_tokens": 2000,
+        "cache_creation_input_tokens": 300}},
+}
+with open(sys.argv[1], "w") as f:
+    f.write(json.dumps(rec) + "\n")
+    rec["requestId"] = "req-2"
+    f.write(json.dumps(rec) + "\n")
+EOF
+CLAUDE_USAGE_TRANSCRIPT_GLOBS="$WORK_DIR/fake/*/*.jsonl" \
+  python3 "$REPO_DIR/dashboard/build.py" -o "$WORK_DIR/dash.html" --quiet
+python3 - "$WORK_DIR/dash.html" <<'EOF'
+import json, re, sys
+html = open(sys.argv[1], encoding="utf-8").read()
+raw = re.search(r'<script id="payload" type="application/json">(.*?)</script>', html, re.S).group(1)
+D = json.loads(raw.replace("<\\/", "</"))
+hosts = {h["host"]: h for h in D["health"]["hosts"]}
+assert "windows" in hosts, f"Windows側がホスト別集計に出ていない: {list(hosts)}"
+assert hosts["windows"]["messages"] == 2, f"応答数が合わない: {hosts['windows']}"
+assert hosts["windows"]["cost"] > 0, "推定コストが0"
+# 台帳側は 2c で積んだWindows側ぶん($2.00)だけ。ホストをまたいで混ざっていないことの確認
+assert abs(hosts["windows"]["ledger_cost"] - 2.00) < 1e-6, \
+    f"台帳のホスト別突き合わせが合わない: {hosts['windows']}"
+gaps = [g for g in D["health"]["gaps"] if g["day"] == "2020-01-02" and g["host"] == "windows"]
+assert gaps, f"計上漏れが検出されていない: {D['health']['gaps']}"
+assert gaps[0]["messages"] == 2, f"計上漏れの応答数が合わない: {gaps[0]}"
+day = [r for r in D["ledger"] if r["day"] == "2020-01-02"]
+assert day and day[0]["estimated"] > 0 and day[0]["subscription"] == 0, \
+    f"台帳に無い日がグラフから落ちている（計上漏れが見えなくなる）: {day}"
+EOF
 echo "OK"
 
 echo ""
