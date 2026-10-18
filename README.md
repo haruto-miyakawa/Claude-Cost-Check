@@ -104,7 +104,7 @@ python3 dashboard/build.py          # 手動で作り直したいとき（2回�
 {
   "statusLine": {
     "type": "command",
-    "command": "python3 /home/harum1020/projects/costs-window/statusline/statusline.py",
+    "command": "python3 /home/<user>/projects/costs-window/statusline/statusline.py",
     "refreshInterval": 30
   }
 }
@@ -122,7 +122,7 @@ Windowsで直接動かすClaude Code（`E:\...` などで作業するセッシ�
 {
   "statusLine": {
     "type": "command",
-    "command": "wsl.exe -e python3 //home/harum1020/projects/costs-window/statusline/statusline.py",
+    "command": "wsl.exe -e python3 //home/<user>/projects/costs-window/statusline/statusline.py",
     "refreshInterval": 30
   }
 }
@@ -132,7 +132,7 @@ Windowsで直接動かすClaude Code（`E:\...` などで作業するセッシ�
 
 Windows版Claude Codeはstatuslineコマンドを**Git Bash経由**で実行する。Git Bash(MSYS2)は、
 ネイティブexe（`wsl.exe`）へ渡す引数のうち `/` で始まるものを勝手にWindowsパスへ変換するため、
-`/home/harum1020/...` は `C:/Program Files/Git/home/harum1020/...` に化ける。結果、
+`/home/<user>/...` は `C:/Program Files/Git/home/<user>/...` に化ける。結果、
 `python3: can't open file` で終了コード2になるが、**Claude Codeはstatuslineの失敗を画面に出さない**ので、
 設定は入っているのに一切収集されない状態が静かに続く（2026-08-14〜08-17に実際に発生）。
 
@@ -143,7 +143,7 @@ cmd.exe / PowerShell / Git Bash のどれで起動されても同じように動
 
 ### 3. Windows側（表示）
 
-エクスプローラーで `\\wsl.localhost\Ubuntu\home\harum1020\projects\costs-window\widget` を開き:
+エクスプローラーで `\\wsl.localhost\Ubuntu\home\<user>\projects\costs-window\widget` を開き:
 
 - **手動起動**: `ClaudeUsageWidget.ps1` を右クリック →「PowerShellで実行」
   （またはターミナルから `powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ClaudeUsageWidget.ps1`）
