@@ -5,6 +5,6 @@ __pycache__/
 # 生成物（プロジェクト名・作業ディレクトリのパスを含むため公開しない）
 dashboard.html
 
-# AI指示ファイル（vault導線を含み得るため非公開・ローカル専用）
+# AI 向けの指示ファイル（手元だけで使う）
 CLAUDE.md
 CLAUDE.local.md
