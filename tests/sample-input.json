@@ -1,5 +1,5 @@
 {
-  "cwd": "/home/harum1020/projects/costs-window",
+  "cwd": "/home/<user>/projects/costs-window",
   "session_id": "test-session-0001",
   "transcript_path": "/tmp/transcript.jsonl",
   "model": {
@@ -7,8 +7,8 @@
     "display_name": "Fable 5"
   },
   "workspace": {
-    "current_dir": "/home/harum1020/projects/costs-window",
-    "project_dir": "/home/harum1020/projects/costs-window",
+    "current_dir": "/home/<user>/projects/costs-window",
+    "project_dir": "/home/<user>/projects/costs-window",
     "added_dirs": []
   },
   "version": "2.1.200",
