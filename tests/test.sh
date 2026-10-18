@@ -92,7 +92,7 @@ EOF
 echo "OK"
 
 echo "--- 2c. ホスト判定: Windows側セッションを windows として記録し、台帳もホスト別に分ける"
-echo '{"session_id": "win-session", "cwd": "E:\\obsidian-vault", "cost": {"total_cost_usd": 2.00}, "model": {"display_name": "Opus 5"}, "rate_limits": {"five_hour": {"used_percentage": 9, "resets_at": 9999999999}}}' | python3 "$SCRIPT" > /dev/null
+echo '{"session_id": "win-session", "cwd": "E:\\sample-project", "cost": {"total_cost_usd": 2.00}, "model": {"display_name": "Opus 5"}, "rate_limits": {"five_hour": {"used_percentage": 9, "resets_at": 9999999999}}}' | python3 "$SCRIPT" > /dev/null
 python3 - "$WORK_DIR/usage.json" "$WORK_DIR/cost-ledger.json" <<'EOF'
 import json, sys, time
 snap = json.load(open(sys.argv[1]))
@@ -138,12 +138,12 @@ echo "OK"
 
 echo "--- 5. ダッシュボード: ホスト別集計と計上漏れの検出"
 # Windows側のトランスクリプトを模したファイルを作る（台帳には存在しない日付にする）
-FAKE="$WORK_DIR/fake/E--obsidian-vault"
+FAKE="$WORK_DIR/fake/E--sample-project"
 mkdir -p "$FAKE"
 python3 - "$FAKE/win-sess.jsonl" <<'EOF'
 import json, sys
 rec = {
-    "type": "assistant", "cwd": "E:\\obsidian-vault", "sessionId": "win-sess",
+    "type": "assistant", "cwd": "E:\\sample-project", "sessionId": "win-sess",
     "timestamp": "2020-01-02T03:04:05Z", "requestId": "req-1",
     "message": {"model": "claude-opus-5", "usage": {
         "input_tokens": 1000, "output_tokens": 500, "cache_read_input_tokens": 2000,
