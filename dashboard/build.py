@@ -1020,6 +1020,10 @@ const fmtTok = n => {
 };
 const fmtUsd = n => "$" + (n || 0).toLocaleString("ja-JP", {minimumFractionDigits: 2, maximumFractionDigits: 2});
 const pad = n => String(n).padStart(2, "0");
+// 小窓（showTip）は HTML として組み立てる。記録から来る文字（プロジェクト名・モデル名・
+// ツール名・日付）がタグとして動かないよう、小窓に入れる値は必ずこれを通す
+const esc = s => String(s).replace(/[&<>"']/g,
+  c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"})[c]);
 const dt = t => new Date(t * 1000);
 const fmtDateTime = t => { const d = dt(t); return `${d.getMonth()+1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
 const fmtDate = t => { const d = dt(t); return `${d.getMonth()+1}/${d.getDate()}`; };
@@ -1281,7 +1285,7 @@ gauge("g7", "g7t", "g7r", D.rate_limits.seven_day, "7d");
     for (const p of data) { const d2 = Math.abs(p.t - t); if (d2 < bd) { bd = d2; best = p; } }
     cross.setAttribute("x1", X(best.t)); cross.setAttribute("x2", X(best.t));
     cross.setAttribute("opacity", 1);
-    showTip(`<b>${fmtDateTime(best.t)}</b><br><span class="k">5時間枠</span> ${best.five ?? "–"}%<br><span class="k">7日枠</span> ${best.seven ?? "–"}%`,
+    showTip(`<b>${esc(fmtDateTime(best.t))}</b><br><span class="k">5時間枠</span> ${esc(best.five ?? "–")}%<br><span class="k">7日枠</span> ${esc(best.seven ?? "–")}%`,
             ev.clientX, ev.clientY);
   });
   hit.addEventListener("mouseleave", () => { cross.setAttribute("opacity", 0); hideTip(); });
@@ -1352,9 +1356,9 @@ gauge("g7", "g7t", "g7r", D.rate_limits.seven_day, "7d");
     const hit = svgEl("rect", {x: M.l + band * i, y: M.t, width: band, height: ih, fill: "transparent"});
     const missing = r.estimated > 0 && total === 0;
     hit.addEventListener("mousemove", ev => showTip(
-      `<b>${r.day}</b><br><span class="k">サブスク</span> ${fmtUsd(r.subscription)}<br>` +
-      `<span class="k">API</span> ${fmtUsd(r.api)}<br><span class="k">合計</span> ${fmtUsd(total)}<br>` +
-      `<span class="k">実測からの推定</span> ${fmtUsd(r.estimated)}` +
+      `<b>${esc(r.day)}</b><br><span class="k">サブスク</span> ${esc(fmtUsd(r.subscription))}<br>` +
+      `<span class="k">API</span> ${esc(fmtUsd(r.api))}<br><span class="k">合計</span> ${esc(fmtUsd(total))}<br>` +
+      `<span class="k">実測からの推定</span> ${esc(fmtUsd(r.estimated))}` +
       (missing ? `<br><b>台帳に記録なし（計上漏れ）</b>` : ""),
       ev.clientX, ev.clientY));
     hit.addEventListener("mouseleave", hideTip);
@@ -1418,13 +1422,13 @@ function barList(host, items, valueOf, labelOf, color) {
   });
 }
 function tipOf(it) {
-  if (it.n != null && it.input == null) return `<b>${it.name}</b><br>${fmtInt(it.n)} 回`;
+  if (it.n != null && it.input == null) return `<b>${esc(it.name)}</b><br>${esc(fmtInt(it.n))} 回`;
   const tok = it.input + it.output + it.cache_write + it.cache_read;
-  return `<b>${it.name}</b><br>` +
-    `<span class="k">入力</span> ${fmtTok(it.input)} / <span class="k">出力</span> ${fmtTok(it.output)}<br>` +
-    `<span class="k">キャッシュ</span> 書 ${fmtTok(it.cache_write)} / 読 ${fmtTok(it.cache_read)}<br>` +
-    `<span class="k">合計</span> ${fmtTok(tok)}・<span class="k">応答</span> ${fmtInt(it.messages)}<br>` +
-    `<span class="k">推定コスト</span> ${fmtUsd(it.cost)}`;
+  return `<b>${esc(it.name)}</b><br>` +
+    `<span class="k">入力</span> ${esc(fmtTok(it.input))} / <span class="k">出力</span> ${esc(fmtTok(it.output))}<br>` +
+    `<span class="k">キャッシュ</span> 書 ${esc(fmtTok(it.cache_write))} / 読 ${esc(fmtTok(it.cache_read))}<br>` +
+    `<span class="k">合計</span> ${esc(fmtTok(tok))}・<span class="k">応答</span> ${esc(fmtInt(it.messages))}<br>` +
+    `<span class="k">推定コスト</span> ${esc(fmtUsd(it.cost))}`;
 }
 
 barList(document.getElementById("projbars"), D.projects,
@@ -1513,7 +1517,7 @@ document.getElementById("modeltable").appendChild(table(
         cell.style.background = steps[idx];
       }
       cell.addEventListener("mousemove", ev => showTip(
-        `<b>${WD[w]}曜 ${pad(h)}:00</b><br>${fmtInt(n)} 応答`, ev.clientX, ev.clientY));
+        `<b>${esc(WD[w])}曜 ${esc(pad(h))}:00</b><br>${esc(fmtInt(n))} 応答`, ev.clientX, ev.clientY));
       cell.addEventListener("mouseleave", hideTip);
       host.appendChild(cell);
       cells.push(cell);
@@ -1535,8 +1539,8 @@ document.getElementById("modeltable").appendChild(table(
     ? `（うち ${fmtInt(t.files_gone)} ファイルは Claude Code の自動削除で消滅済み・集計はキャッシュに保持）`
     : "";
   document.getElementById("footnotes").innerHTML =
-    `トランスクリプト ${fmtInt(t.files)} ファイルを集計${gone}。応答 ${fmtInt(t.messages)} 件／` +
-    `セッション ${fmtInt(t.sessions)} 件／APIエラー応答 ${fmtInt(t.errors)} 件。<br>` +
+    `トランスクリプト ${esc(fmtInt(t.files))} ファイルを集計${esc(gone)}。応答 ${esc(fmtInt(t.messages))} 件／` +
+    `セッション ${esc(fmtInt(t.sessions))} 件／APIエラー応答 ${esc(fmtInt(t.errors))} 件。<br>` +
     `「日別コスト」は Claude Code が報告する実測値。「推定コスト」は公式の従量課金レート` +
     `（キャッシュ読込 0.1倍・書込 1.25〜2倍）でトークンから計算した目安で、実際の請求額ではない。<br>` +
     `このページはローカル生成・ローカル完結。プロジェクト名やパスを含むため外部に公開しないこと。`;
@@ -1559,7 +1563,10 @@ def main():
     payload = build_payload()
     html = TEMPLATE.replace(
         "__DATA__",
-        json.dumps(payload, ensure_ascii=False).replace("</", "<\\/"),
+        # プロジェクト名などは記録から来る。<script> の中で `</script>` や `<!--` として
+        # 読まれないよう、< > & は JSON の \u 形式にする（JSON.parse で元の文字に戻る）
+        json.dumps(payload, ensure_ascii=False)
+        .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"),
     )
     # ブラウザが書きかけのHTMLを読まないよう、一時ファイル経由で置換する
     import tempfile

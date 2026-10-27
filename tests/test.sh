@@ -310,5 +310,95 @@ assert abs(day[0]["cost"] - 4.00) < 1e-9, f"サブエージェント込みの値
 EOF
 echo "OK"
 
+echo "--- 8. ダッシュボード: 記録から来る名前を HTML として動かさない"
+EVIL="$WORK_DIR/evil/sample-project"
+mkdir -p "$EVIL"
+python3 - "$EVIL/sess.jsonl" <<'EOF'
+import json, sys
+rec = {
+    "type": "assistant", "sessionId": "evil-sess", "timestamp": "2020-01-06T03:04:05Z",
+    "requestId": "e1",
+    # フォルダ名・モデル名・ツール名に、タグや </script>・<!-- を入れておく
+    "cwd": "/tmp/<img src=x onerror=alert(1)><!--<script>",
+    "message": {"model": "claude-</script><b>x</b>", "usage": {"input_tokens": 10},
+                "content": [{"type": "tool_use", "name": "<svg onload=alert(1)>"}]},
+}
+with open(sys.argv[1], "w") as f:
+    f.write(json.dumps(rec) + "\n")
+EOF
+# ほかのテストのキャッシュと混ざると、この名前が「その他」に畳まれるので、置き場を分ける
+CLAUDE_USAGE_WIDGET_DIR="$WORK_DIR/data8" CLAUDE_USAGE_TRANSCRIPT_GLOBS="$WORK_DIR/evil/*/*.jsonl" \
+  python3 "$REPO_DIR/dashboard/build.py" -o "$WORK_DIR/dash8.html" --quiet
+python3 - "$WORK_DIR/dash8.html" <<'EOF'
+import json, re, sys
+html = open(sys.argv[1], encoding="utf-8").read()
+# 埋め込んだデータの中に、生の < > が残っていない（</script> や <!-- として読まれない）
+m = re.search(r'<script id="payload" type="application/json">(.*?)</script>', html, re.S)
+raw = m.group(1)
+assert "<" not in raw and ">" not in raw, "埋め込んだデータに生の < > が残っている"
+D = json.loads(raw)
+names = [p["name"] for p in D["projects"]] + [m["name"] for m in D["models"]]
+assert "<img src=x onerror=alert(1)><!--<script>" in names, f"名前が元の文字に戻らない: {names}"
+assert "claude-</script><b>x</b>" in names, f"モデル名が元の文字に戻らない: {names}"
+tools = [t["name"] for t in D["tools"]]
+assert "<svg onload=alert(1)>" in tools, f"ツール名が元の文字に戻らない: {tools}"
+
+# HTML として入れる場所（showTip の引数・tipOf・innerHTML への代入）の ${...} は、
+# 式まるごとが esc(...) ひとつでなければならない
+def ranges(src):
+    for m in re.finditer(r"showTip\(|\.innerHTML\s*=", src):
+        if src[max(0, m.start() - 9):m.start()] == "function ":
+            continue  # showTip の定義そのもの
+        yield src[m.start():src.index(";\n", m.start())]
+    m = re.search(r"function tipOf\(it\) \{", src)
+    yield src[m.start():src.index("\n}\n", m.start())]
+
+def exprs(text):
+    i = 0
+    while (i := text.find("${", i)) != -1:
+        depth, j = 1, i + 2
+        while depth:
+            depth += {"{": 1, "}": -1}.get(text[j], 0)
+            j += 1
+        yield text[i + 2:j - 1]
+        i = j
+
+def single_esc(expr):
+    if not expr.startswith("esc("):
+        return False
+    depth = 0
+    for k, ch in enumerate(expr[3:], start=3):  # "esc" の次の "(" から数える
+        depth += {"(": 1, ")": -1}.get(ch, 0)
+        if depth == 0:
+            return k == len(expr) - 1  # 最初の esc( の閉じかっこが式の最後
+    return False
+
+found = 0
+for r in ranges(html):
+    for e in exprs(r):
+        found += 1
+        assert single_esc(e), f"esc ひとつで包まずに HTML に入れている: ${{{e}}}"
+assert found >= 20, f"確かめた式が少なすぎる（探し方が壊れている）: {found}"
+EOF
+# esc と tipOf を実際に動かす（node がある環境だけ）
+if command -v node > /dev/null; then
+  node - "$WORK_DIR/dash8.html" <<'EOF'
+const html = require("fs").readFileSync(process.argv[2], "utf8");
+const pick = re => html.match(re)[0];
+const code = [pick(/const fmtInt = [^\n]*/), pick(/const fmtTok = n => \{[\s\S]*?\n\};/),
+  pick(/const fmtUsd = [^\n]*/), pick(/const pad = [^\n]*/), pick(/const esc = s => [\s\S]*?\[c\]\);/),
+  pick(/function tipOf\(it\) \{[\s\S]*?\n\}/), "return tipOf;"].join("\n");
+const tipOf = new Function(code)();
+const D = JSON.parse(html.match(/<script id="payload" type="application\/json">([\s\S]*?)<\/script>/)[1]);
+for (const it of [...D.projects, ...D.models, ...D.tools]) {
+  const out = tipOf(it);
+  if (/<(img|svg|script)|<\/script/i.test(out)) { console.error("小窓に生のタグ: " + out); process.exit(1); }
+}
+EOF
+else
+  echo "（node が無いので、esc を実際に動かす確かめは飛ばした）"
+fi
+echo "OK"
+
 echo ""
 echo "全テスト通過"
