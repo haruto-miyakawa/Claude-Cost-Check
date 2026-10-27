@@ -177,5 +177,138 @@ assert day and day[0]["estimated"] > 0 and day[0]["subscription"] == 0, \
 EOF
 echo "OK"
 
+echo "--- 6. ダッシュボード: モデル別の値段と、値段の表に無いモデルの検出"
+PRICED="$WORK_DIR/priced/sample-project"
+mkdir -p "$PRICED"
+python3 - "$PRICED/sess.jsonl" <<'EOF'
+import json, sys
+def rec(req, model, **usage):
+    return {
+        "type": "assistant", "cwd": "/tmp/sample-project", "sessionId": "priced-sess",
+        "timestamp": "2020-01-03T03:04:05Z", "requestId": req,
+        "message": {"model": model, "usage": usage},
+    }
+rows = [
+    # Opus 5.5: キャッシュ読込は入力単価の0.05倍 → 4.00 + 0.20
+    rec("r1", "claude-opus-5-5", input_tokens=1_000_000, cache_read_input_tokens=1_000_000),
+    # 日付つきのID は表のキー（claude-haiku-4-5）にそろえる → 1.00
+    rec("r2", "claude-haiku-4-5-20251001", input_tokens=1_000_000),
+    # Haiku 5.5: 入力の合計が10万以下は 0.10/MTok → 0.005
+    rec("r3", "claude-haiku-5-5", input_tokens=50_000),
+    # 10万を超えると 0.50/MTok（キャッシュ読込も長さに入る）→ 0.025 + 0.003
+    rec("r4", "claude-haiku-5-5", input_tokens=50_000, cache_read_input_tokens=60_000),
+    # 表に無いモデル → 0 のまま、健全性カードに出る
+    rec("r5", "claude-new-model-9", input_tokens=1_000_000),
+]
+with open(sys.argv[1], "w") as f:
+    for r in rows:
+        f.write(json.dumps(r) + "\n")
+EOF
+check_priced() {
+python3 - "$WORK_DIR/dash6.html" <<'EOF'
+import json, re, sys
+html = open(sys.argv[1], encoding="utf-8").read()
+raw = re.search(r'<script id="payload" type="application/json">(.*?)</script>', html, re.S).group(1)
+D = json.loads(raw.replace("<\\/", "</"))
+models = {m["name"]: m for m in D["models"]}
+def near(a, b):
+    return abs(a - b) < 1e-9
+assert near(models["Opus 5.5"]["cost"], 4.20), f"Opus 5.5 の値段が合わない: {models['Opus 5.5']}"
+assert near(models["Haiku 4.5"]["cost"], 1.00), f"日付つきのIDが表に当たっていない: {list(models)}"
+assert near(models["Haiku 5.5"]["cost"], 0.005 + 0.028), f"Haiku 5.5 の長さの値段が合わない: {models['Haiku 5.5']}"
+assert models["claude-new-model-9"]["cost"] == 0, "表に無いモデルに値段が付いている"
+unpriced = {u["model"]: u["messages"] for u in D["health"]["unpriced"]}
+assert unpriced == {"claude-new-model-9": 1}, f"表に無いモデルが健全性カードに出ていない: {unpriced}"
+EOF
+}
+CLAUDE_USAGE_TRANSCRIPT_GLOBS="$WORK_DIR/priced/*/*.jsonl" \
+  python3 "$REPO_DIR/dashboard/build.py" -o "$WORK_DIR/dash6.html" --quiet
+check_priced
+# 古い値段の表で数えたキャッシュは、元ファイルがあれば読み直される（PRICING_VERSION）
+python3 - "$WORK_DIR/transcript-cache.json" <<'EOF'
+import json, sys
+path = sys.argv[1]
+cache = json.load(open(path))
+for entry in cache["files"].values():
+    if entry["agg"]["model"].get("claude-opus-5-5"):
+        entry["pricing"] = 1
+        entry["agg"]["model"]["claude-opus-5-5"]["cost"] = 0
+json.dump(cache, open(path, "w"))
+EOF
+CLAUDE_USAGE_TRANSCRIPT_GLOBS="$WORK_DIR/priced/*/*.jsonl" \
+  python3 "$REPO_DIR/dashboard/build.py" -o "$WORK_DIR/dash6.html" --quiet
+check_priced
+echo "OK"
+
+echo "--- 6b. 元ファイルが消えた古い集計: 0円のまま残る分を知らせる"
+GONE="$WORK_DIR/gone/sample-project"
+mkdir -p "$GONE"
+python3 - "$GONE/old.jsonl" <<'EOF'
+import json, sys
+rec = {
+    "type": "assistant", "cwd": "/tmp/sample-project", "sessionId": "gone-sess",
+    "timestamp": "2020-01-05T03:04:05Z", "requestId": "g1",
+    "message": {"model": "claude-opus-5-5", "usage": {"input_tokens": 1_000_000}},
+}
+with open(sys.argv[1], "w") as f:
+    f.write(json.dumps(rec) + "\n")
+EOF
+CLAUDE_USAGE_TRANSCRIPT_GLOBS="$WORK_DIR/gone/*/*.jsonl" \
+  python3 "$REPO_DIR/dashboard/build.py" -o "$WORK_DIR/dash6b.html" --quiet
+# 値段の表の版が無かったころのキャッシュを再現する（pricing キーなし・日付つきID・0円）
+python3 - "$WORK_DIR/transcript-cache.json" "$GONE/old.jsonl" <<'EOF'
+import json, os, sys
+path, target = sys.argv[1], os.path.realpath(sys.argv[2])
+cache = json.load(open(path))
+entry = cache["files"][target]
+del entry["pricing"]
+bucket = entry["agg"]["model"].pop("claude-opus-5-5")
+bucket["cost"] = 0
+entry["agg"]["model"]["claude-opus-5-5-20260101"] = bucket
+entry["agg"].pop("unpriced", None)
+json.dump(cache, open(path, "w"))
+EOF
+rm "$GONE/old.jsonl"
+CLAUDE_USAGE_TRANSCRIPT_GLOBS="$WORK_DIR/gone/*/*.jsonl" \
+  python3 "$REPO_DIR/dashboard/build.py" -o "$WORK_DIR/dash6b.html" --quiet
+python3 - "$WORK_DIR/dash6b.html" <<'EOF'
+import json, re, sys
+html = open(sys.argv[1], encoding="utf-8").read()
+raw = re.search(r'<script id="payload" type="application/json">(.*?)</script>', html, re.S).group(1)
+D = json.loads(raw.replace("<\\/", "</"))
+stale = {u["model"]: u["messages"] for u in D["health"]["stale_unpriced"]}
+assert stale.get("claude-opus-5-5") == 1, f"消えたファイルの0円の分が知らされていない: {stale}"
+names = [m["name"] for m in D["models"]]
+assert "claude-opus-5-5-20260101" not in names, f"古いキャッシュの日付つきIDが別の行になった: {names}"
+EOF
+echo "OK"
+
+echo "--- 7. ダッシュボード: サブエージェントの記録（下のフォルダ）も数える"
+SUB="$WORK_DIR/nested/sample-project/parent-sess/subagents"
+mkdir -p "$SUB"
+python3 - "$WORK_DIR/nested/sample-project/parent-sess.jsonl" "$SUB/agent-1.jsonl" <<'EOF'
+import json, sys
+for path, req in ((sys.argv[1], "main-1"), (sys.argv[2], "sub-1")):
+    rec = {
+        "type": "assistant", "cwd": "/tmp/sample-project", "sessionId": "parent-sess",
+        "timestamp": "2020-01-04T03:04:05Z", "requestId": req,
+        "message": {"model": "claude-sonnet-5-5", "usage": {"input_tokens": 1_000_000}},
+    }
+    with open(path, "w") as f:
+        f.write(json.dumps(rec) + "\n")
+EOF
+CLAUDE_USAGE_TRANSCRIPT_GLOBS="$WORK_DIR/nested/**/*.jsonl" \
+  python3 "$REPO_DIR/dashboard/build.py" -o "$WORK_DIR/dash7.html" --quiet
+python3 - "$WORK_DIR/dash7.html" <<'EOF'
+import json, re, sys
+html = open(sys.argv[1], encoding="utf-8").read()
+raw = re.search(r'<script id="payload" type="application/json">(.*?)</script>', html, re.S).group(1)
+D = json.loads(raw.replace("<\\/", "</"))
+day = [d for d in D["days"] if d["day"] == "2020-01-04"]
+assert day and day[0]["messages"] == 2, f"サブエージェントの記録が数えられていない: {day}"
+assert abs(day[0]["cost"] - 4.00) < 1e-9, f"サブエージェント込みの値段が合わない: {day}"
+EOF
+echo "OK"
+
 echo ""
 echo "全テスト通過"

@@ -30,13 +30,15 @@ DEFAULT_OUT = os.path.join(os.path.dirname(HERE), "dashboard.html")
 CACHE_FILE = os.path.join(DATA_DIR, "transcript-cache.json")
 
 # トランスクリプトの探索先（WSL側とWindows側の両方。存在するものだけ使う）。
+# サブエージェントの記録は <プロジェクト>/<セッション>/subagents/ の下に別ファイルで残るので、
+# フォルダの下まで全部たどる（`**` は glob の recursive=True で効く）。
 # テストから差し替えられるよう、環境変数で上書きできる（`:` 区切り）
 TRANSCRIPT_GLOBS = (
     os.environ.get("CLAUDE_USAGE_TRANSCRIPT_GLOBS", "").split(":")
     if os.environ.get("CLAUDE_USAGE_TRANSCRIPT_GLOBS")
     else [
-        os.path.expanduser("~/.claude/projects/*/*.jsonl"),
-        "/mnt/c/Users/*/.claude/projects/*/*.jsonl",
+        os.path.expanduser("~/.claude/projects/**/*.jsonl"),
+        "/mnt/c/Users/*/.claude/projects/**/*.jsonl",
     ]
 )
 
@@ -47,33 +49,59 @@ ERROR_TAIL_LINES = 12
 HOST_LABELS = {"windows": "Windows側", "wsl": "WSL側", "unknown": "(不明)"}
 
 # 公式の従量課金レート（$ / 100万トークン）。サブスク利用でも「API換算いくらぶんか」を出すために使う。
-# 出典: claude-api skill のモデル表（2026-06-24 時点のキャッシュ）
+# 出典: 公式の料金ページ https://platform.claude.com/docs/en/about-claude/pricing （2026-10-27 に確かめた）
+# 表に無いモデルは推定コストが0になる。黙って減らないよう、健全性カードに「値段の表に無いモデル」として出す
 PRICING = {
+    "claude-fable-5-1": (10.0, 50.0),
+    "claude-mythos-5-1": (10.0, 50.0),
     "claude-fable-5": (10.0, 50.0),
     "claude-mythos-5": (10.0, 50.0),
+    "claude-opus-5-5": (4.0, 20.0),
     "claude-opus-5": (5.0, 25.0),
     "claude-opus-4-8": (5.0, 25.0),
     "claude-opus-4-7": (5.0, 25.0),
     "claude-opus-4-6": (5.0, 25.0),
     "claude-opus-4-5": (5.0, 25.0),
-    "claude-sonnet-5": (3.0, 15.0),
+    "claude-opus-4-1": (15.0, 75.0),
+    "claude-sonnet-5-5": (2.0, 10.0),
+    "claude-sonnet-5": (2.0, 10.0),
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-sonnet-4-5": (3.0, 15.0),
+    "claude-haiku-5-5": (0.10, 0.50),
     "claude-haiku-4-5": (1.0, 5.0),
 }
+# 表を変えたら上げる。キャッシュに残った古い値段の集計を、元ファイルがあるものから読み直させる
+PRICING_VERSION = 2
 CACHE_WRITE_5M = 1.25  # 入力単価に対する倍率
 CACHE_WRITE_1H = 2.0
 CACHE_READ = 0.1
+# キャッシュ読込の倍率が 0.1 でないモデル（料金ページの注記）
+CACHE_READ_BY_MODEL = {
+    "claude-fable-5-1": 0.025,
+    "claude-mythos-5-1": 0.025,
+    "claude-opus-5-5": 0.05,
+    "claude-sonnet-5-5": 0.05,
+}
+# プロンプトの長さで値段が上がるモデル: (しきい値, 入力, 出力)。
+# 長さはキャッシュの読み書きも含めた入力の合計で、リクエストごとに決まる（料金ページの Long context pricing）
+LONG_PROMPT_PRICING = {
+    "claude-haiku-5-5": (100_000, 0.50, 2.50),
+}
 
 MODEL_LABELS = {
+    "claude-fable-5-1": "Fable 5.1",
+    "claude-mythos-5-1": "Mythos 5.1",
     "claude-fable-5": "Fable 5",
     "claude-mythos-5": "Mythos 5",
+    "claude-opus-5-5": "Opus 5.5",
     "claude-opus-5": "Opus 5",
     "claude-opus-4-8": "Opus 4.8",
     "claude-opus-4-7": "Opus 4.7",
     "claude-opus-4-6": "Opus 4.6",
+    "claude-sonnet-5-5": "Sonnet 5.5",
     "claude-sonnet-5": "Sonnet 5",
     "claude-sonnet-4-6": "Sonnet 4.6",
+    "claude-haiku-5-5": "Haiku 5.5",
     "claude-haiku-4-5": "Haiku 4.5",
 }
 
@@ -143,8 +171,16 @@ def host_of(cwd):
     return "wsl"
 
 
+def base_model(model):
+    """日付つきのモデルID（claude-haiku-4-5-20251001 など）を値段の表のキーにそろえる。"""
+    return re.sub(r"-\d{8}$", "", model)
+
+
 def cost_of(model, usage):
-    """1レスポンスぶんのAPI換算コスト（$）。キャッシュのTTL別倍率まで見る。"""
+    """1レスポンスぶんのAPI換算コスト（$）。キャッシュのTTL別倍率まで見る。
+
+    値段の表に無いモデルは0を返す。呼ぶ側は `model in PRICING` で数え漏れを記録すること。
+    """
     price = PRICING.get(model)
     if not price:
         return 0.0
@@ -154,10 +190,14 @@ def cost_of(model, usage):
     w5m = cc.get("ephemeral_5m_input_tokens") or 0
     if not (w1h or w5m):  # 内訳が無ければ合計を5分TTL扱いにする
         w5m = usage.get("cache_creation_input_tokens") or 0
+    cread = usage.get("cache_read_input_tokens") or 0
+    long_prompt = LONG_PROMPT_PRICING.get(model)
+    if long_prompt and (usage.get("input_tokens") or 0) + cread + w5m + w1h > long_prompt[0]:
+        inp, outp = long_prompt[1], long_prompt[2]
     return (
         (usage.get("input_tokens") or 0) * inp
         + (usage.get("output_tokens") or 0) * outp
-        + (usage.get("cache_read_input_tokens") or 0) * inp * CACHE_READ
+        + cread * inp * CACHE_READ_BY_MODEL.get(model, CACHE_READ)
         + w5m * inp * CACHE_WRITE_5M
         + w1h * inp * CACHE_WRITE_1H
     ) / 1_000_000
@@ -199,7 +239,9 @@ def scan_file(path):
     1回のAPI応答が複数のassistantレコードに分かれ、それぞれが**同じ usage を持つ**ため、
     usage は requestId 単位で1度だけ数える（レコード単位で足すと数倍に膨らむ）。
     ツール呼び出しはレコードごとに中身が違うので全レコードから拾う。
-    ファイルをまたぐ requestId の重複は実測ゼロなので、ファイル単位で閉じて数えてよい。
+    ファイルをまたぐ requestId の重複は 2026-08 には実測ゼロだったので、ファイル単位で閉じて数える。
+    2026-10 に、ある会話の記録が別の会話のファイルに写っている例を見つけた。
+    その分は二重に数える（README の既知の挙動）。
     """
     agg = {
         "project": {}, "model": {}, "day": {},
@@ -207,6 +249,8 @@ def scan_file(path):
         # 「トランスクリプトには活動があるのに台帳に記録が無い日」を割り出すために使う
         "host": {}, "day_host": {},
         "heat": {}, "tools": {},
+        # 値段の表に無いモデルの応答数。この分の推定コストは0になっている
+        "unpriced": {},
         "totals": {k: 0 for k in NUMERIC_KEYS},
         "sessions": set(),
     }
@@ -232,7 +276,7 @@ def scan_file(path):
             if rec.get("type") != "assistant":
                 continue
             msg = rec.get("message") or {}
-            model = msg.get("model") or "(不明)"
+            model = base_model(msg.get("model") or "(不明)")
             if model.startswith("<"):  # <synthetic> 等はAPI利用ではない
                 continue
             agg["totals"]["records"] += 1
@@ -254,6 +298,8 @@ def scan_file(path):
             cwrite = usage.get("cache_creation_input_tokens") or 0
             think = (usage.get("output_tokens_details") or {}).get("thinking_tokens") or 0
             cost = cost_of(model, usage)
+            if model not in PRICING:
+                agg["unpriced"][model] = agg["unpriced"].get(model, 0) + 1
             sid = rec.get("sessionId") or rec.get("session_id") or ""
             ts = parse_ts(rec.get("timestamp"))
 
@@ -351,7 +397,7 @@ def scan_transcripts():
 
     present, rescanned = set(), 0
     for pattern in TRANSCRIPT_GLOBS:
-        for path in glob.glob(pattern):
+        for path in glob.glob(pattern, recursive=True):
             real = os.path.realpath(path)
             if real in present:
                 continue
@@ -361,12 +407,20 @@ def scan_transcripts():
             except OSError:
                 continue
             entry = files.get(real)
-            if entry and entry.get("size") == st.st_size and entry.get("mtime") == int(st.st_mtime):
+            if (
+                entry
+                and entry.get("size") == st.st_size
+                and entry.get("mtime") == int(st.st_mtime)
+                and entry.get("pricing") == PRICING_VERSION
+            ):
                 continue  # 変わっていない: キャッシュをそのまま使う
             agg = scan_file(real)
             if agg is None:
                 continue
-            files[real] = {"size": st.st_size, "mtime": int(st.st_mtime), "agg": agg}
+            files[real] = {
+                "size": st.st_size, "mtime": int(st.st_mtime),
+                "pricing": PRICING_VERSION, "agg": agg,
+            }
             rescanned += 1
 
     # 集計を合算（消えたファイルのぶんもキャッシュに残っているので一緒に足す）
@@ -377,6 +431,10 @@ def scan_transcripts():
     by_day_host = collections.defaultdict(blank_bucket)
     heat = collections.Counter()
     tools = collections.Counter()
+    unpriced = collections.Counter()
+    # 元ファイルが消えて読み直せない、古い値段の表で数えた集計のうち、コストが0のままのモデル。
+    # 当時は表に無く、今は表にあっても、もう数え直せない（推定がその分だけ低い）
+    stale_unpriced = collections.Counter()
     totals = blank_bucket()
     for extra in ("records", "sidechain", "errors", "web_search", "web_fetch"):
         totals[extra] = 0
@@ -388,12 +446,19 @@ def scan_transcripts():
             ("host", by_host), ("day_host", by_day_host),
         ):
             for name, b in (agg.get(kind) or {}).items():
-                merge_bucket(dst[name], b)
+                # 古いキャッシュには日付つきのモデルIDのまま残っていることがある
+                merge_bucket(dst[base_model(name) if kind == "model" else name], b)
+        if entry.get("pricing") != PRICING_VERSION:
+            for name, b in (agg.get("model") or {}).items():
+                if b.get("messages") and not b.get("cost"):
+                    stale_unpriced[base_model(name)] += b["messages"]
         for k, n in (agg.get("heat") or {}).items():
             w, h = k.split(",")
             heat[(int(w), int(h))] += n
         for name, n in (agg.get("tools") or {}).items():
             tools[name] += n
+        for name, n in (agg.get("unpriced") or {}).items():
+            unpriced[name] += n
         t = agg.get("totals") or {}
         for k in NUMERIC_KEYS:
             totals[k] += t.get(k, 0)
@@ -414,6 +479,8 @@ def scan_transcripts():
         "by_day_host": by_day_host,
         "heat": heat,
         "tools": tools,
+        "unpriced": unpriced,
+        "stale_unpriced": stale_unpriced,
         "totals": totals,
         "files": len(files),
         "files_present": len(present),
@@ -529,6 +596,14 @@ def build_health(scan, ledger):
         "hosts": hosts,
         "gaps": gaps,
         "gap_cost": round(sum(g["est_cost"] for g in gaps), 4),
+        # 値段の表に無いモデル。推定コストに入っていないので、新しいモデルが出たら表に足す
+        "unpriced": [
+            {"model": m, "messages": n} for m, n in scan["unpriced"].most_common()
+        ],
+        # 元ファイルが消えて数え直せない古い集計で、コストが0のままの応答（直す手は無いので知らせだけ）
+        "stale_unpriced": [
+            {"model": m, "messages": n} for m, n in scan["stale_unpriced"].most_common()
+        ],
         "errors": read_error_tail(),
     }
 
@@ -1102,15 +1177,19 @@ gauge("g7", "g7t", "g7r", D.rate_limits.seven_day, "7d");
     ]));
   }
 
-  // 判定: 未計上の日があれば警告、statusline.err があれば異常
+  // 判定: 未計上の日か値段の表に無いモデルがあれば警告、statusline.err があれば異常
   const nErr = H.errors.exists ? H.errors.count : 0;
   const nGap = H.gaps.length;
-  const state = nErr ? "bad" : (nGap ? "warn" : "ok");
+  const nUnpriced = H.unpriced.length;
+  const state = nErr ? "bad" : (nGap || nUnpriced ? "warn" : "ok");
   if (state !== "ok") card.classList.add(state);
+  const warns = [];
+  if (nGap) warns.push(`トランスクリプトに活動があるのに台帳に記録が無い日が ${nGap} 件（推定 ${fmtUsd(H.gap_cost)} ぶん）。`);
+  if (nUnpriced) warns.push(`値段の表に無いモデルが ${nUnpriced} 種類ある（その応答の推定コストは0のまま）。`);
   const msg = state === "bad"
     ? `statusline がエラーを記録している（${fmtInt(nErr)}件）。下のログを確認すること。`
     : state === "warn"
-      ? `トランスクリプトに活動があるのに台帳に記録が無い日が ${nGap} 件（推定 ${fmtUsd(H.gap_cost)} ぶん）。`
+      ? warns.join("")
       : "台帳とトランスクリプトの対象ホスト・日は一致している。計上漏れは検出されていない。";
   document.getElementById("verdict").appendChild(el("span", {class: "dot"}));
   document.getElementById("verdict").appendChild(el("span", {}, [msg]));
@@ -1125,6 +1204,20 @@ gauge("g7", "g7t", "g7r", D.rate_limits.seven_day, "7d");
     if (H.gaps.length > 20) {
       box.appendChild(el("div", {class: "note"}, [`ほか ${H.gaps.length - 20} 件`]));
     }
+  }
+
+  if (nUnpriced) {
+    const box = document.getElementById("gaps");
+    box.appendChild(el("div", {class: "note", style: "color:var(--muted);font-size:12.5px;margin:12px 0 6px"},
+      ["値段の表に無いモデル（dashboard/build.py の PRICING に足すと推定コストに入る）"]));
+    box.appendChild(table(["モデル", "応答"], H.unpriced.map(u => [u.model, fmtInt(u.messages)])));
+  }
+
+  if (H.stale_unpriced.length) {
+    const box = document.getElementById("gaps");
+    box.appendChild(el("div", {class: "note", style: "color:var(--muted);font-size:12.5px;margin:12px 0 6px"},
+      ["元のファイルが消えて数え直せない古い集計で、推定コストが0のままの応答（当時は値段の表に無かったモデル。推定はこの分だけ低い）"]));
+    box.appendChild(table(["モデル", "応答"], H.stale_unpriced.map(u => [u.model, fmtInt(u.messages)])));
   }
 
   if (H.errors.exists && H.errors.lines.length) {
